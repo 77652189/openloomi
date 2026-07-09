@@ -4,6 +4,7 @@ import {
   createMemoryQueryApi,
   normalizeMemoryRecordForIngest,
   normalizeMemoryRecordsForIngest,
+  type MemoryDeprecateRecordsInput,
   type MemoryLockHandle,
   type MemoryPageResult,
   type MemoryRecord,
@@ -28,7 +29,10 @@ class InMemoryStorageAdapter implements MemoryStorageAdapter {
   saveSummaryCalls = 0;
   transitionCalls = 0;
   archiveCalls = 0;
+  deprecateCalls = 0;
   markAccessCalls = 0;
+  deprecateInputs: MemoryDeprecateRecordsInput[] = [];
+  events: string[] = [];
 
   async acquireLock(input: {
     key: string;
@@ -67,6 +71,7 @@ class InMemoryStorageAdapter implements MemoryStorageAdapter {
 
   async saveSummaries(summaries: MemorySummary[]): Promise<void> {
     this.saveSummaryCalls += 1;
+    this.events.push("saveSummaries");
     this.summaries.push(...summaries);
   }
 
@@ -78,6 +83,7 @@ class InMemoryStorageAdapter implements MemoryStorageAdapter {
     summaryId?: string;
   }): Promise<void> {
     this.transitionCalls += 1;
+    this.events.push("transitionRecords");
     for (const record of this.records) {
       if (record.userId !== input.userId) continue;
       if (!input.ids.includes(record.id)) continue;
@@ -96,6 +102,7 @@ class InMemoryStorageAdapter implements MemoryStorageAdapter {
     archivedAt: number;
   }): Promise<void> {
     this.archiveCalls += 1;
+    this.events.push("archiveRecordDetails");
     for (const record of this.records) {
       if (record.userId !== input.userId) continue;
       if (!input.ids.includes(record.id)) continue;
@@ -129,6 +136,23 @@ class InMemoryStorageAdapter implements MemoryStorageAdapter {
       record.accessCount = (record.accessCount ?? 0) + 1;
     }
   }
+
+  async deprecateRecords(input: MemoryDeprecateRecordsInput): Promise<number> {
+    this.deprecateCalls += 1;
+    this.deprecateInputs.push(input);
+    this.events.push("deprecateRecords");
+    let affectedRows = 0;
+    for (const record of this.records) {
+      if (record.userId !== input.userId) continue;
+      if (!input.ids.includes(record.id)) continue;
+      if (record.deprecatedAt !== undefined) continue;
+      record.deprecatedAt = input.deprecatedAt;
+      record.deprecationReason = input.reason;
+      record.supersededBySummaryId = input.supersededBySummaryId;
+      affectedRows += 1;
+    }
+    return affectedRows;
+  }
 }
 
 function createRecord(
@@ -153,6 +177,9 @@ function createRecord(
     archivedAt: input.archivedAt,
     dimensions: input.dimensions,
     metadata: input.metadata,
+    deprecatedAt: input.deprecatedAt,
+    deprecationReason: input.deprecationReason,
+    supersededBySummaryId: input.supersededBySummaryId,
   };
 }
 
@@ -338,6 +365,8 @@ describe("memory forgetting engine", () => {
     const result = await engine.runCycle({ userId: "u1" });
 
     expect(result.status).toBe("skipped_locked");
+    expect(result.deprecatedRecords).toBe(0);
+    expect(result.deprecationDiagnostics).toEqual([]);
     expect(storage.acquireCalls).toBe(1);
     expect(storage.releaseCalls).toBe(0);
   });
@@ -384,6 +413,9 @@ describe("memory forgetting engine", () => {
     expect(storage.saveSummaryCalls).toBe(0);
     expect(storage.transitionCalls).toBe(0);
     expect(storage.archiveCalls).toBe(0);
+    expect(storage.deprecateCalls).toBe(0);
+    expect(result.deprecatedRecords).toBe(0);
+    expect(result.deprecationDiagnostics).toEqual([]);
     expect(storage.releaseCalls).toBe(1);
   });
 
@@ -503,7 +535,9 @@ describe("memory forgetting engine", () => {
 
     expect(result.createdSummaries).toBe(2);
     expect(result.transitionedRecords).toBe(6);
+    expect(result.deprecatedRecords).toBe(6);
     expect(storage.saveSummaryCalls).toBeGreaterThan(0);
+    expect(storage.deprecateCalls).toBe(2);
     expect(storage.transitionCalls).toBeGreaterThan(0);
     expect(storage.archiveCalls).toBeGreaterThan(0);
 
@@ -518,6 +552,242 @@ describe("memory forgetting engine", () => {
     expect(midNowLong.every((record) => record.archivedAt !== undefined)).toBe(
       true,
     );
+    expect(storage.records.every((record) => record.deprecatedAt === now)).toBe(
+      true,
+    );
+  });
+
+  it("soft-deprecates source records after summary save and before transition", async () => {
+    const storage = new InMemoryStorageAdapter();
+    const now = Date.now();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const shortWindowStart =
+      Math.floor(
+        (now - DEFAULT_MEMORY_FORGETTING_POLICY.shortMaxAgeMs - 2 * dayMs) /
+          DEFAULT_MEMORY_FORGETTING_POLICY.groupWindowMs.short,
+      ) * DEFAULT_MEMORY_FORGETTING_POLICY.groupWindowMs.short;
+    storage.records = [
+      createRecord({
+        id: "s1",
+        userId: "u1",
+        tier: "short",
+        timestamp: shortWindowStart + 1_000,
+        text: "old short one",
+      }),
+      createRecord({
+        id: "s2",
+        userId: "u1",
+        tier: "short",
+        timestamp: shortWindowStart + 2_000,
+        text: "old short two",
+      }),
+      createRecord({
+        id: "s3",
+        userId: "u1",
+        tier: "short",
+        timestamp: shortWindowStart + 3_000,
+        text: "old short three",
+      }),
+    ];
+
+    const engine = createMemoryForgettingEngine({ storage });
+    const result = await engine.runCycle({ userId: "u1", now, dryRun: false });
+    const summaryId = storage.summaries[0]?.summaryId;
+
+    expect(result.deprecatedRecords).toBe(3);
+    expect(result.deprecationDiagnostics).toEqual([
+      expect.objectContaining({
+        summaryId,
+        status: "persisted",
+        plannedRecordIds: ["s1", "s2", "s3"],
+        plannedCount: 3,
+        persistedCount: 3,
+        reasonCodes: expect.arrayContaining(["persisted"]),
+      }),
+    ]);
+    expect(storage.events).toEqual([
+      "saveSummaries",
+      "deprecateRecords",
+      "transitionRecords",
+    ]);
+    expect(storage.deprecateInputs).toEqual([
+      expect.objectContaining({
+        userId: "u1",
+        ids: ["s1", "s2", "s3"],
+        deprecatedAt: now,
+        reason: `summarized_into:${summaryId}`,
+        supersededBySummaryId: summaryId,
+      }),
+    ]);
+    expect(
+      storage.records.map((record) => ({
+        id: record.id,
+        tier: record.tier,
+        deprecatedAt: record.deprecatedAt,
+        supersededBySummaryId: record.supersededBySummaryId,
+      })),
+    ).toEqual([
+      {
+        id: "s1",
+        tier: "mid",
+        deprecatedAt: now,
+        supersededBySummaryId: summaryId,
+      },
+      {
+        id: "s2",
+        tier: "mid",
+        deprecatedAt: now,
+        supersededBySummaryId: summaryId,
+      },
+      {
+        id: "s3",
+        tier: "mid",
+        deprecatedAt: now,
+        supersededBySummaryId: summaryId,
+      },
+    ]);
+  });
+
+  it("can disable runtime deprecation without blocking transitions", async () => {
+    const storage = new InMemoryStorageAdapter();
+    const now = Date.now();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const shortWindowStart =
+      Math.floor(
+        (now - DEFAULT_MEMORY_FORGETTING_POLICY.shortMaxAgeMs - 2 * dayMs) /
+          DEFAULT_MEMORY_FORGETTING_POLICY.groupWindowMs.short,
+      ) * DEFAULT_MEMORY_FORGETTING_POLICY.groupWindowMs.short;
+    storage.records = ["s1", "s2", "s3"].map((id, index) =>
+      createRecord({
+        id,
+        userId: "u1",
+        tier: "short",
+        timestamp: shortWindowStart + (index + 1) * 1_000,
+      }),
+    );
+
+    const engine = createMemoryForgettingEngine({
+      storage,
+      deprecation: { enabled: false },
+    });
+    const result = await engine.runCycle({ userId: "u1", now, dryRun: false });
+
+    expect(result.transitionedRecords).toBe(3);
+    expect(result.deprecatedRecords).toBe(0);
+    expect(result.deprecationDiagnostics).toEqual([
+      expect.objectContaining({
+        status: "disabled",
+        plannedRecordIds: ["s1", "s2", "s3"],
+        reasonCodes: ["persistence_disabled"],
+      }),
+    ]);
+    expect(storage.deprecateCalls).toBe(0);
+    expect(storage.records.every((record) => record.tier === "mid")).toBe(true);
+    expect(
+      storage.records.every((record) => record.deprecatedAt === undefined),
+    ).toBe(true);
+  });
+
+  it("reports no-op diagnostics when the adapter lacks deprecateRecords", async () => {
+    const backing = new InMemoryStorageAdapter();
+    const now = Date.now();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const shortWindowStart =
+      Math.floor(
+        (now - DEFAULT_MEMORY_FORGETTING_POLICY.shortMaxAgeMs - 2 * dayMs) /
+          DEFAULT_MEMORY_FORGETTING_POLICY.groupWindowMs.short,
+      ) * DEFAULT_MEMORY_FORGETTING_POLICY.groupWindowMs.short;
+    backing.records = ["s1", "s2", "s3"].map((id, index) =>
+      createRecord({
+        id,
+        userId: "u1",
+        tier: "short",
+        timestamp: shortWindowStart + (index + 1) * 1_000,
+      }),
+    );
+    const storage: MemoryStorageAdapter = {
+      acquireLock: backing.acquireLock.bind(backing),
+      releaseLock: backing.releaseLock.bind(backing),
+      listCandidates: backing.listCandidates.bind(backing),
+      saveSummaries: backing.saveSummaries.bind(backing),
+      transitionRecords: backing.transitionRecords.bind(backing),
+      archiveRecordDetails: backing.archiveRecordDetails.bind(backing),
+      queryRaw: backing.queryRaw.bind(backing),
+      querySummaries: backing.querySummaries.bind(backing),
+    };
+
+    const engine = createMemoryForgettingEngine({ storage });
+    const result = await engine.runCycle({ userId: "u1", now, dryRun: false });
+
+    expect(result.transitionedRecords).toBe(3);
+    expect(result.deprecatedRecords).toBe(0);
+    expect(result.deprecationDiagnostics).toEqual([
+      expect.objectContaining({
+        status: "no-op",
+        plannedRecordIds: ["s1", "s2", "s3"],
+        reasonCodes: ["adapter_missing_deprecate_records"],
+      }),
+    ]);
+    expect(backing.records.every((record) => record.tier === "mid")).toBe(true);
+    expect(
+      backing.records.every((record) => record.deprecatedAt === undefined),
+    ).toBe(true);
+  });
+
+  it("continues transitions when deprecation adapter fails", async () => {
+    class ThrowingDeprecateStorageAdapter extends InMemoryStorageAdapter {
+      async deprecateRecords(
+        input: MemoryDeprecateRecordsInput,
+      ): Promise<number> {
+        this.deprecateCalls += 1;
+        this.deprecateInputs.push(input);
+        this.events.push("deprecateRecords");
+        throw new Error("deprecate failed");
+      }
+    }
+
+    const storage = new ThrowingDeprecateStorageAdapter();
+    const now = Date.now();
+    const dayMs = 24 * 60 * 60 * 1000;
+    const shortWindowStart =
+      Math.floor(
+        (now - DEFAULT_MEMORY_FORGETTING_POLICY.shortMaxAgeMs - 2 * dayMs) /
+          DEFAULT_MEMORY_FORGETTING_POLICY.groupWindowMs.short,
+      ) * DEFAULT_MEMORY_FORGETTING_POLICY.groupWindowMs.short;
+    storage.records = ["s1", "s2", "s3"].map((id, index) =>
+      createRecord({
+        id,
+        userId: "u1",
+        tier: "short",
+        timestamp: shortWindowStart + (index + 1) * 1_000,
+      }),
+    );
+
+    const engine = createMemoryForgettingEngine({ storage });
+    const result = await engine.runCycle({ userId: "u1", now, dryRun: false });
+
+    expect(result.transitionedRecords).toBe(3);
+    expect(result.deprecatedRecords).toBe(0);
+    expect(result.deprecationDiagnostics).toEqual([
+      expect.objectContaining({
+        status: "failed",
+        plannedRecordIds: ["s1", "s2", "s3"],
+        reasonCodes: ["adapter_error"],
+        error: {
+          name: "Error",
+          message: "deprecate failed",
+        },
+      }),
+    ]);
+    expect(storage.events).toEqual([
+      "saveSummaries",
+      "deprecateRecords",
+      "transitionRecords",
+    ]);
+    expect(storage.records.every((record) => record.tier === "mid")).toBe(true);
+    expect(
+      storage.records.every((record) => record.deprecatedAt === undefined),
+    ).toBe(true);
   });
 });
 

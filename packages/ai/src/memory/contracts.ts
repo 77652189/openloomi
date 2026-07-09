@@ -259,6 +259,19 @@ export interface MemoryForgettingRunInput {
   dryRun?: boolean;
 }
 
+export interface MemoryForgettingDeprecationDiagnostic {
+  summaryId: string;
+  status: "disabled" | "dry-run" | "persisted" | "no-op" | "failed";
+  plannedRecordIds: string[];
+  plannedCount: number;
+  persistedCount: number;
+  reasonCodes: string[];
+  error?: {
+    name: string;
+    message: string;
+  };
+}
+
 export interface MemoryForgettingRunResult {
   status: "success" | "skipped_locked";
   dryRun: boolean;
@@ -270,6 +283,8 @@ export interface MemoryForgettingRunResult {
   createdSummaries: number;
   transitionedRecords: number;
   archivedDetailRecords: number;
+  deprecatedRecords: number;
+  deprecationDiagnostics: MemoryForgettingDeprecationDiagnostic[];
 }
 
 export type MemorySearchHit =

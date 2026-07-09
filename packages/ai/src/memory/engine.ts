@@ -1,4 +1,5 @@
 import type {
+  MemoryForgettingDeprecationDiagnostic,
   MemoryForgettingRunInput,
   MemoryForgettingRunResult,
   MemoryGroup,
@@ -9,6 +10,11 @@ import type {
   MemorySummarizer,
   ScoredMemoryRecord,
 } from "./contracts";
+import {
+  deprecateMemoryRecords,
+  type DeprecatablePlanEntry,
+  type DeprecateMemoryRecordsResult,
+} from "./deprecation";
 import {
   bucketStart,
   type MemoryForgettingPolicy,
@@ -25,11 +31,20 @@ export interface MemoryForgettingEngine {
   runCycle(input: MemoryForgettingRunInput): Promise<MemoryForgettingRunResult>;
 }
 
+export interface MemoryForgettingDeprecationOptions {
+  /**
+   * Defaults to true. Missing adapter support still degrades to diagnostics, so
+   * older stores remain compatible while capable stores soft-hide sources.
+   */
+  enabled?: boolean;
+}
+
 export interface CreateMemoryForgettingEngineInput {
   storage: MemoryStorageAdapter;
   policy?: MemoryForgettingPolicyOverrides;
   scorer?: MemoryRecordScorer;
   summarizer?: MemorySummarizer;
+  deprecation?: MemoryForgettingDeprecationOptions;
 }
 
 function clampTimestamp(value: number): number {
@@ -56,6 +71,73 @@ function hashString(input: string): string {
   }
   // Unsigned 32-bit.
   return (hash >>> 0).toString(16);
+}
+
+function buildSummaryDeprecationEntry(
+  summary: MemorySummary,
+): DeprecatablePlanEntry {
+  return {
+    action: "deprecate",
+    recordIds: [...summary.sourceRecordIds],
+    supersededBySummaryId: summary.summaryId,
+    deprecationReason: `summarized_into:${summary.summaryId}`,
+  };
+}
+
+function toDeprecationDiagnostic(
+  summaryId: string,
+  result: DeprecateMemoryRecordsResult,
+): MemoryForgettingDeprecationDiagnostic {
+  return {
+    summaryId,
+    status: result.status,
+    plannedRecordIds: result.plannedRecordIds,
+    plannedCount: result.plannedCount,
+    persistedCount: result.persistedCount,
+    reasonCodes: result.reasonCodes,
+  };
+}
+
+function errorInfo(error: unknown): { name: string; message: string } {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+    };
+  }
+  return {
+    name: "Error",
+    message: String(error),
+  };
+}
+
+async function deprecateSummarySources(input: {
+  storage: MemoryStorageAdapter;
+  userId: string;
+  summary: MemorySummary;
+  now: number;
+  enabled: boolean;
+}): Promise<MemoryForgettingDeprecationDiagnostic> {
+  try {
+    const result = await deprecateMemoryRecords({
+      userId: input.userId,
+      entries: [buildSummaryDeprecationEntry(input.summary)],
+      store: input.storage,
+      now: input.now,
+      enabled: input.enabled,
+    });
+    return toDeprecationDiagnostic(input.summary.summaryId, result);
+  } catch (error) {
+    return {
+      summaryId: input.summary.summaryId,
+      status: "failed",
+      plannedRecordIds: [...input.summary.sourceRecordIds],
+      plannedCount: input.summary.sourceRecordIds.length,
+      persistedCount: 0,
+      reasonCodes: ["adapter_error"],
+      error: errorInfo(error),
+    };
+  }
 }
 
 function buildSummaryId(input: {
@@ -161,6 +243,8 @@ export function createMemoryForgettingEngine(
           createdSummaries: 0,
           transitionedRecords: 0,
           archivedDetailRecords: 0,
+          deprecatedRecords: 0,
+          deprecationDiagnostics: [],
         };
       }
 
@@ -169,6 +253,9 @@ export function createMemoryForgettingEngine(
       let createdSummaries = 0;
       let transitionedRecords = 0;
       let archivedDetailRecords = 0;
+      let deprecatedRecords = 0;
+      const deprecationDiagnostics: MemoryForgettingDeprecationDiagnostic[] =
+        [];
 
       try {
         const phases: Array<{
@@ -209,6 +296,7 @@ export function createMemoryForgettingEngine(
             (record) =>
               !record.isPinned &&
               record.archivedAt === undefined &&
+              record.deprecatedAt === undefined &&
               record.valueScore <= phase.threshold,
           );
 
@@ -257,6 +345,16 @@ export function createMemoryForgettingEngine(
 
             if (!dryRun) {
               await input.storage.saveSummaries([summary]);
+              const deprecationDiagnostic = await deprecateSummarySources({
+                storage: input.storage,
+                userId: runInput.userId,
+                summary,
+                now,
+                enabled: input.deprecation?.enabled ?? true,
+              });
+              deprecationDiagnostics.push(deprecationDiagnostic);
+              deprecatedRecords += deprecationDiagnostic.persistedCount;
+
               await input.storage.transitionRecords({
                 userId: runInput.userId,
                 ids: summary.sourceRecordIds,
@@ -294,6 +392,8 @@ export function createMemoryForgettingEngine(
         createdSummaries,
         transitionedRecords,
         archivedDetailRecords,
+        deprecatedRecords,
+        deprecationDiagnostics,
       };
     },
   };

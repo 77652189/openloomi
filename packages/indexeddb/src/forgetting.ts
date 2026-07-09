@@ -1,6 +1,8 @@
 import {
   createMemoryForgettingEngine,
   createMemoryQueryApi,
+  type MemoryForgettingDeprecationDiagnostic,
+  type MemoryForgettingDeprecationOptions,
   type MemoryForgettingPolicyOverrides,
   type MemoryLockHandle,
   type MemoryPageResult,
@@ -532,6 +534,7 @@ export interface RunMemoryForgettingCycleOptions {
   now?: number;
   dryRun?: boolean;
   policy?: MemoryForgettingPolicyOverrides;
+  deprecation?: MemoryForgettingDeprecationOptions;
   hardDeleteArchivedOlderThan?: number;
   shadowDiagnostics?: RunMemoryForgettingCycleShadowDiagnosticsOptions;
 }
@@ -547,6 +550,8 @@ export interface RunMemoryForgettingCycleResult {
   createdSummaries: number;
   transitionedRecords: number;
   archivedDetailRecords: number;
+  deprecatedRecords: number;
+  deprecationDiagnostics: MemoryForgettingDeprecationDiagnostic[];
   hardDeletedRecords: number;
   shadowDiagnostics?: MemoryConsolidationShadowDiagnosticsRunResult;
 }
@@ -561,6 +566,7 @@ export async function runMemoryForgettingCycle(
   const engine = createMemoryForgettingEngine({
     storage,
     policy: options?.policy,
+    deprecation: options?.deprecation,
   });
   const now =
     options?.shadowDiagnostics === undefined

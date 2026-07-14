@@ -6,12 +6,14 @@ mutation path.
 
 ## Inputs
 
-The rollout gate consumes already-built dry-run artifacts:
+The rollout gate consumes either persisted runtime evidence or compatible
+dry-run artifacts:
 
 - consolidation evaluation metrics
 - graph-aware retrieval scenario results
 - semantic retrieval eval scenario reports
-- governance correction and rollback command dry-runs
+- persisted correction and rollback operation identities, with command dry-runs
+  retained as a compatibility input
 - polluted-memory audit scenario reports
 
 ## Required Gates
@@ -30,17 +32,20 @@ The rollout gate consumes already-built dry-run artifacts:
 
 ## Correction Model
 
-Corrections are represented as dry-run governance commands. A correction command
-must target an explained artifact and include non-empty corrected content. The
-command report records the current revision status, affected source records, and
-reason codes without changing stored memory.
+Corrections are explicit, owner-scoped, versioned graph commands. Runtime
+corrections can change membership, lifecycle, or preferred representation and
+can persist corrected summary content. Prior nodes, edges, and operation history
+remain available for audit. Dry-run command reports remain supported for review,
+but they do not satisfy runtime-evidence gates when persisted evidence is
+provided.
 
 ## Rollback Rules
 
-Rollback is available only when rollback provenance exists on the target memory
-or the command provides explicit rollback metadata. Rollback commands are dry-run
-only at this phase. They prove that a polluted, stale, or wrongly consolidated
-memory can be reversed without deleting the raw audit chain.
+Rollback is available only when the persisted graph exposes source provenance.
+Runtime rollback first restores graph visibility, then restores matching raw
+soft-deprecation fields, and only then retires the representative and
+supersession edges. Missing restoration capability or a partial failure leaves
+the active representative available and returns retryable diagnostics.
 
 ## Rollout Decision
 
@@ -49,6 +54,6 @@ memory can be reversed without deleting the raw audit chain.
 - `ready-for-limited-rollout` when every gate passes
 - `blocked` when any gate fails
 
-The report is intentionally conservative. Failing gates should lead to more
-evaluation, corrected graph policy, or rollback/correction dry-runs before any
-broader runtime enablement.
+The report is intentionally conservative. Missing semantic, polluted-memory,
+correction, rollback, or audit evidence produces `blocked`; feature presence
+alone cannot authorize broader runtime enablement.

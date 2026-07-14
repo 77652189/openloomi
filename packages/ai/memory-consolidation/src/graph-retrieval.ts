@@ -8,6 +8,7 @@ import type {
   MemoryGraphNode,
   OwnerScope,
 } from "./graph-contracts";
+import { applicabilityEquivalent } from "./graph-evolution";
 
 export interface BuildGraphAwareRetrievalDryRunInput extends GraphAwareRetrievalInput {
   maxExpandedRepresentatives?: number;
@@ -40,7 +41,13 @@ function scopedEdges(
   edges: MemoryGraphEdge[],
   ownerScope: OwnerScope,
 ): MemoryGraphEdge[] {
-  return edges.filter((edge) => sameOwnerScope(edge.ownerScope, ownerScope));
+  return edges.filter(
+    (edge) =>
+      sameOwnerScope(edge.ownerScope, ownerScope) &&
+      edge.weight > 0 &&
+      edge.metadata?.inactive !== true &&
+      edge.metadata?.rolledBack !== true,
+  );
 }
 
 function scopedClusters(
@@ -57,7 +64,10 @@ function isSummaryLike(node: MemoryGraphNode | undefined): boolean {
 }
 
 function isDeprecatedRaw(node: MemoryGraphNode | undefined): boolean {
-  return node?.type === "raw" && node.visibility === "deprecated";
+  return (
+    node?.type === "raw" &&
+    (node.visibility === "deprecated" || node.visibility === "audit-only")
+  );
 }
 
 function isAuditOnly(node: MemoryGraphNode | undefined): boolean {
@@ -68,14 +78,15 @@ function shouldHideByDefault(
   node: MemoryGraphNode | undefined,
   includeDeprecated: boolean,
   auditMode: boolean,
+  conflictMode = false,
 ): boolean {
   if (node === undefined) {
     return true;
   }
-  if (isAuditOnly(node) && !auditMode) {
+  if (isAuditOnly(node) && !auditMode && !conflictMode) {
     return true;
   }
-  return isDeprecatedRaw(node) && !includeDeprecated;
+  return node.visibility === "deprecated" && !includeDeprecated;
 }
 
 function uniqueExistingBaselineNodeIds(
@@ -163,6 +174,49 @@ function expandedRepresentatives(input: {
     ),
     clusterIds,
   };
+}
+
+function sameApplicability(
+  left: MemoryGraphClusterSnapshot,
+  right: MemoryGraphClusterSnapshot,
+): boolean {
+  return applicabilityEquivalent(left.applicability, right.applicability);
+}
+
+function conflictAlternatives(input: {
+  baselineNodeIds: string[];
+  clusters: MemoryGraphClusterSnapshot[];
+  edges: MemoryGraphEdge[];
+  nodesById: Map<string, MemoryGraphNode>;
+}): { nodeIds: string[]; clusterIds: string[] } {
+  const baseline = new Set(input.baselineNodeIds);
+  const touched = input.clusters.filter((cluster) =>
+    clusterTouchesBaseline(cluster, baseline),
+  );
+  const nodeIds: string[] = [];
+  const clusterIds: string[] = [];
+  for (const sourceCluster of touched) {
+    if (!sourceCluster.competitionKey) continue;
+    for (const candidate of input.clusters) {
+      if (
+        candidate.competitionKey !== sourceCluster.competitionKey ||
+        !sameApplicability(candidate, sourceCluster)
+      ) {
+        continue;
+      }
+      const representative = representativeForCluster(
+        candidate,
+        input.edges,
+        input.nodesById,
+      );
+      const alternative =
+        representative ??
+        candidate.nodeIds.find((nodeId) => input.nodesById.has(nodeId));
+      if (alternative) addUnique(nodeIds, [alternative]);
+      addUnique(clusterIds, [candidate.clusterId]);
+    }
+  }
+  return { nodeIds, clusterIds };
 }
 
 function supersedeTargetsForHiddenNodes(
@@ -300,6 +354,7 @@ function reasonCodesForResult(input: {
   expandedClusterIds: string[];
   auditTrailCount: number;
   includeDeprecated: boolean;
+  conflictAlternativesExposed: boolean;
   filteredMissingOrCrossScopeCount: number;
 }): string[] {
   return uniqueValues([
@@ -308,6 +363,9 @@ function reasonCodesForResult(input: {
       ? ["default_hides_deprecated_raw"]
       : []),
     ...(input.includeDeprecated ? ["include_deprecated_requested"] : []),
+    ...(input.conflictAlternativesExposed
+      ? ["competing_alternatives_exposed"]
+      : []),
     ...(input.expandedClusterIds.length > 0
       ? ["cluster_representative_prioritized"]
       : []),
@@ -323,6 +381,7 @@ export function buildGraphAwareRetrievalDryRun(
 ): GraphAwareRetrievalResult {
   const includeDeprecated = input.includeDeprecated === true;
   const auditMode = input.visibilityMode === "audit";
+  const conflictMode = input.visibilityMode === "conflict";
   const nodesById = scopedNodesById(input.snapshot.nodes, input.ownerScope);
   const edges = scopedEdges(input.snapshot.edges, input.ownerScope);
   const clusters = scopedClusters(input.snapshot.clusters, input.ownerScope);
@@ -334,7 +393,12 @@ export function buildGraphAwareRetrievalDryRun(
   );
   const visibleBaselineNodeIds = baselineNodeIds.filter(
     (nodeId) =>
-      !shouldHideByDefault(nodesById.get(nodeId), includeDeprecated, auditMode),
+      !shouldHideByDefault(
+        nodesById.get(nodeId),
+        includeDeprecated,
+        auditMode,
+        conflictMode,
+      ),
   );
   const representativeExpansion = expandedRepresentatives({
     baselineNodeIds,
@@ -348,18 +412,34 @@ export function buildGraphAwareRetrievalDryRun(
     edges,
     nodesById,
   );
+  const conflictExpansion = conflictMode
+    ? conflictAlternatives({
+        baselineNodeIds,
+        clusters,
+        edges,
+        nodesById,
+      })
+    : { nodeIds: [], clusterIds: [] };
   const rankedNodeIds = rankNodeIds({
     visibleBaselineNodeIds,
     includeDeprecated,
-    representativeNodeIds: representativeExpansion.nodeIds,
+    representativeNodeIds: uniqueValues([
+      ...representativeExpansion.nodeIds,
+      ...conflictExpansion.nodeIds,
+    ]),
     supersedeTargetNodeIds,
     nodesById,
   }).filter(
     (nodeId) =>
-      !shouldHideByDefault(nodesById.get(nodeId), includeDeprecated, auditMode),
+      !shouldHideByDefault(
+        nodesById.get(nodeId),
+        includeDeprecated,
+        auditMode,
+        conflictMode,
+      ),
   );
   const auditNodeIds =
-    auditMode || includeDeprecated
+    auditMode || conflictMode || includeDeprecated
       ? uniqueValues([
           ...rankedNodeIds,
           ...hiddenDeprecatedNodeIds,
@@ -380,13 +460,20 @@ export function buildGraphAwareRetrievalDryRun(
     ownerScope: input.ownerScope,
     rankedNodeIds,
     hiddenDeprecatedNodeIds: includeDeprecated ? [] : hiddenDeprecatedNodeIds,
-    expandedClusterIds: representativeExpansion.clusterIds,
+    expandedClusterIds: uniqueValues([
+      ...representativeExpansion.clusterIds,
+      ...conflictExpansion.clusterIds,
+    ]),
     auditTrail,
     reasonCodes: reasonCodesForResult({
       hiddenDeprecatedNodeIds: includeDeprecated ? [] : hiddenDeprecatedNodeIds,
-      expandedClusterIds: representativeExpansion.clusterIds,
+      expandedClusterIds: uniqueValues([
+        ...representativeExpansion.clusterIds,
+        ...conflictExpansion.clusterIds,
+      ]),
       auditTrailCount: auditTrail?.length ?? 0,
       includeDeprecated,
+      conflictAlternativesExposed: conflictExpansion.nodeIds.length > 0,
       filteredMissingOrCrossScopeCount,
     }),
     metadata: {

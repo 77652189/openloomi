@@ -446,29 +446,98 @@ export function createRawMessageMemoryGraphStore(input: {
           reasonCodes: ["memory_graph_scope_mismatch"],
         };
       }
-      const node = ledger.snapshot.nodes.find(
-        (item) => item.id === query.nodeId,
+      const nodesById = new Map(
+        ledger.snapshot.nodes.map((node) => [node.id, node]),
       );
+      const root = nodesById.get(query.nodeId);
+      const visited = new Set<string>();
+      const queue = root ? [root.id] : [];
+      while (queue.length > 0) {
+        const nodeId = queue.shift();
+        if (!nodeId || visited.has(nodeId)) continue;
+        visited.add(nodeId);
+        const node = nodesById.get(nodeId);
+        const metadataSourceIds = Array.isArray(node?.metadata?.sourceNodeIds)
+          ? node.metadata.sourceNodeIds.filter(
+              (value): value is string => typeof value === "string",
+            )
+          : [];
+        const adjacentSourceIds = ledger.snapshot.edges
+          .filter(
+            (edge) =>
+              edge.kind === "supersede" &&
+              (edge.toNodeId === nodeId || edge.fromNodeId === nodeId),
+          )
+          .flatMap((edge) => [
+            edge.fromNodeId,
+            edge.toNodeId,
+            ...edge.evidenceNodeIds,
+          ]);
+        const linkedNodeIds = ledger.snapshot.nodes
+          .filter(
+            (candidate) =>
+              candidate.sourceId === nodeId ||
+              candidate.metadata?.supersededBySummaryId === nodeId ||
+              candidate.metadata?.correctedByRepresentativeId === nodeId,
+          )
+          .map((candidate) => candidate.id);
+        for (const candidateId of [
+          ...(node?.sourceId ? [node.sourceId] : []),
+          ...metadataSourceIds,
+          ...adjacentSourceIds,
+          ...linkedNodeIds,
+        ]) {
+          if (nodesById.has(candidateId) && !visited.has(candidateId)) {
+            queue.push(candidateId);
+          }
+        }
+      }
       const edges = ledger.snapshot.edges.filter(
-        (edge) =>
-          edge.fromNodeId === query.nodeId || edge.toNodeId === query.nodeId,
+        (edge) => visited.has(edge.fromNodeId) || visited.has(edge.toNodeId),
       );
-      const operations = ledger.appliedOperations.filter((operation) =>
-        operation.nodeIds.includes(query.nodeId),
+      const operations = ledger.appliedOperations.filter(
+        (operation) =>
+          operation.nodeIds.some((nodeId) => visited.has(nodeId)) ||
+          (operation.supersededByNodeId !== undefined &&
+            visited.has(operation.supersededByNodeId)),
       );
       return {
         ownerScope: { ...input.ownerScope },
         nodeId: query.nodeId,
-        sourceNodeIds: [
-          ...(node?.sourceId ? [node.sourceId] : []),
-          ...edges.flatMap((edge) => edge.evidenceNodeIds),
-        ].filter((value, index, values) => values.indexOf(value) === index),
+        sourceNodeIds: [...visited].filter(
+          (nodeId) =>
+            nodeId !== query.nodeId && nodesById.get(nodeId)?.type === "raw",
+        ),
         edgeIds: edges.map((edge) => edge.id),
         operationIds: operations.map((operation) => operation.operationId),
-        reasonCodes: node
+        reasonCodes: root
           ? ["memory_graph_audit_trail_available"]
           : ["memory_graph_node_not_found"],
+        metadata: {
+          traversalDepth: visited.size,
+          includeDeprecated: query.includeDeprecated === true,
+        },
       };
+    },
+
+    async readAppliedOperations(query) {
+      const ledger = await readLedger();
+      if (!sameOwnerScope(query.ownerScope, input.ownerScope)) return [];
+      return ledger.appliedOperations
+        .filter(
+          (operation) =>
+            query.nodeId === undefined ||
+            operation.nodeIds.includes(query.nodeId) ||
+            operation.supersededByNodeId === query.nodeId,
+        )
+        .map((operation) => ({
+          ...operation,
+          ownerScope: { ...operation.ownerScope },
+          nodeIds: [...operation.nodeIds],
+          edgeIds: operation.edgeIds ? [...operation.edgeIds] : undefined,
+          reasonCodes: [...operation.reasonCodes],
+          metadata: operation.metadata ? { ...operation.metadata } : undefined,
+        }));
     },
   };
 }

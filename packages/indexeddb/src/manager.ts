@@ -732,7 +732,7 @@ class IndexedDBManager implements RawMessageStorageManager {
 
   private async updateMessagesByMessageIds(
     messageIds: string[],
-    updater: (message: RawMessage) => RawMessage,
+    updater: (message: RawMessage) => RawMessage | undefined,
     userId?: string,
   ): Promise<number> {
     return this.withRetry(async () => {
@@ -766,7 +766,9 @@ class IndexedDBManager implements RawMessageStorageManager {
             if (userId && existing.userId !== userId) {
               return;
             }
-            objectStore.put(updater(existing));
+            const updated = updater(existing);
+            if (!updated) return;
+            objectStore.put(updated);
             updatedCount += 1;
           };
           getRequest.onerror = () => reject(getRequest.error);
@@ -832,6 +834,30 @@ class IndexedDBManager implements RawMessageStorageManager {
         archivedAt,
       }),
       userId,
+    );
+  }
+
+  async restoreDeprecatedMessages(
+    messageIds: string[],
+    input: { userId?: string; supersededBySummaryId?: string } = {},
+  ): Promise<number> {
+    return this.updateMessagesByMessageIds(
+      messageIds,
+      (message) => {
+        if (message.deprecatedAt === undefined) return undefined;
+        if (
+          input.supersededBySummaryId &&
+          message.supersededBySummaryId !== input.supersededBySummaryId
+        ) {
+          return undefined;
+        }
+        const restored = { ...message };
+        restored.deprecatedAt = undefined;
+        restored.deprecationReason = undefined;
+        restored.supersededBySummaryId = undefined;
+        return restored;
+      },
+      input.userId,
     );
   }
 

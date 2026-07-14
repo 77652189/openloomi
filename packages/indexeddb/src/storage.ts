@@ -176,6 +176,14 @@ export interface RawMessageStorage {
       supersededBySummaryId?: string;
     },
   ): Promise<number>;
+  /** Restore only records still deprecated by the targeted summary. */
+  restoreDeprecatedMessages?(
+    messageIds: string[],
+    input: {
+      userId?: string;
+      supersededBySummaryId?: string;
+    },
+  ): Promise<number>;
   hardDeleteArchived(olderThan: number, userId?: string): Promise<number>;
   updateMessageEmbeddings(
     updates: RawMessageEmbeddingUpdate[],

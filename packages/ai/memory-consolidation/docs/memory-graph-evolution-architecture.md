@@ -383,13 +383,14 @@ Already available:
 - deprecated-record filtering and `includeDeprecated` audit retrieval
 - graph-aware filtering and ranking of baseline retrieval candidates
 - relation observations and competition-oriented diagnostics
+- persisted owner-scoped graph evolution and cluster lifecycle decisions
+- lifecycle-driven summary persistence and source soft-deprecation
+- explicit correction, rollback, recursive audit, and runtime rollout evidence
 
-Next architecture gap:
+Remaining rollout boundary:
 
-- ingest-time interaction that updates durable graph relations and clusters
-- lifecycle decisions driven by accumulated graph evidence
-- consolidation and weakening driven by lifecycle state
-- explicit correction and rollback of graph evolution
+- broader automatic enablement remains blocked until required runtime evaluation
+  artifacts pass the rollout governance gates
 
 ## PR Reference Contract
 

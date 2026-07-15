@@ -284,8 +284,10 @@ describe("memory graph correction, rollback, and rollout runtime", () => {
       },
     });
     expect(result.status).toBe("applied");
-    expect(result.restoredRecords).toBe(1);
-    expect(manager.messages.get("zh-3")?.deprecatedAt).toBeUndefined();
+    expect(result.restoredRecords).toBe(3);
+    for (const id of ["zh-1", "zh-2", "zh-3"]) {
+      expect(manager.messages.get(id)?.deprecatedAt).toBeUndefined();
+    }
     const snapshot = await graph(manager);
     expect(
       snapshot.clusters.find((item) => item.clusterId === cluster.clusterId)
@@ -308,6 +310,14 @@ describe("memory graph correction, rollback, and rollout runtime", () => {
           edge.metadata?.inactive === true,
       ),
     ).toBe(true);
+    expect(
+      snapshot.nodes.find((node) => node.id === cluster.representativeNodeId)
+        ?.visibility,
+    ).toBe("audit-only");
+    expect(
+      snapshot.clusters.find((item) => item.clusterId === cluster.clusterId)
+        ?.representativeNodeId,
+    ).toBeUndefined();
     const operations = await createRawMessageMemoryGraphStore({
       storage: manager,
       ownerScope: OWNER,
@@ -437,7 +447,8 @@ describe("memory graph correction, rollback, and rollout runtime", () => {
 
   it("rolls back persisted consolidation, restores raw retrieval, and is idempotent", async () => {
     const manager = new GovernanceRuntimeTestManager();
-    const { summary } = await seedConsolidated(manager);
+    const { summary, snapshot: initialSnapshot } =
+      await seedConsolidated(manager);
     const first = await runMemoryGraphRollback({
       storage: manager,
       userId: OWNER.userId,
@@ -445,6 +456,7 @@ describe("memory graph correction, rollback, and rollout runtime", () => {
       command: {
         commandId: "rollback-consolidation",
         reason: "The consolidation must be reversed for review",
+        expectedVersion: initialSnapshot.version,
         summaryId: summary.summaryId,
       },
     });
@@ -479,12 +491,94 @@ describe("memory graph correction, rollback, and rollout runtime", () => {
       command: {
         commandId: "rollback-consolidation",
         reason: "The consolidation must be reversed for review",
+        expectedVersion: initialSnapshot.version,
         summaryId: summary.summaryId,
       },
     });
     expect(["no-op", "replayed"]).toContain(replay.status);
     expect(replay.restoredRecords).toBe(0);
     expect(manager.messages.get("zh-1")?.deprecatedAt).toBeUndefined();
+  });
+
+  it("hides a superseded summary by default and restores it on rollback", async () => {
+    const manager = new GovernanceRuntimeTestManager();
+    const { summary: oldSummary } = await seedConsolidated(manager);
+    await storeEvidence(
+      manager,
+      [rawMessage("en-1", { relationValue: "en" })],
+      NOW + 4000,
+    );
+    await storeEvidence(
+      manager,
+      [rawMessage("en-2", { relationValue: "en" })],
+      NOW + 5000,
+    );
+    await storeEvidence(
+      manager,
+      [rawMessage("en-3", { relationValue: "en" })],
+      NOW + 6000,
+    );
+    const lifecycle = await runMemoryForgettingCycle(
+      manager as never,
+      OWNER.userId,
+      { now: NOW + 7000, graphLifecycle: { enabled: true } },
+    );
+    expect(lifecycle.graphLifecycle?.createdSummaries).toBe(1);
+    const superseded = await graph(manager);
+    const newSummary = superseded.nodes.find(
+      (node) =>
+        node.type === "summary" &&
+        node.id !== oldSummary.summaryId &&
+        node.visibility === "default",
+    );
+    expect(newSummary).toBeDefined();
+    expect(
+      superseded.nodes.find((node) => node.id === oldSummary.summaryId)
+        ?.visibility,
+    ).toBe("audit-only");
+    expect(
+      superseded.edges.some(
+        (edge) =>
+          edge.kind === "supersede" &&
+          edge.fromNodeId === oldSummary.summaryId &&
+          edge.toNodeId === newSummary?.id,
+      ),
+    ).toBe(true);
+    const defaultRetrieval = buildGraphAwareRetrievalDryRun({
+      ownerScope: OWNER,
+      query: "language preference",
+      baselineNodeIds: superseded.nodes.map((node) => node.id),
+      snapshot: superseded,
+      visibilityMode: "default",
+    });
+    expect(defaultRetrieval.rankedNodeIds).toContain(newSummary?.id);
+    expect(defaultRetrieval.rankedNodeIds).not.toContain(oldSummary.summaryId);
+
+    const rollback = await runMemoryGraphRollback({
+      storage: manager,
+      userId: OWNER.userId,
+      now: NOW + 8000,
+      command: {
+        commandId: "rollback-preference-supersession",
+        reason: "Restore the previous reviewed preference",
+        summaryId: newSummary?.id ?? "",
+      },
+    });
+    expect(rollback.status).toBe("applied");
+    const restored = await graph(manager);
+    expect(
+      restored.nodes.find((node) => node.id === oldSummary.summaryId)
+        ?.visibility,
+    ).toBe("default");
+    expect(
+      restored.nodes.find((node) => node.id === newSummary?.id)?.visibility,
+    ).toBe("audit-only");
+    for (const id of ["zh-1", "zh-2", "zh-3"]) {
+      expect(manager.messages.get(id)?.deprecatedAt).toBeDefined();
+    }
+    for (const id of ["en-1", "en-2", "en-3"]) {
+      expect(manager.messages.get(id)?.deprecatedAt).toBeUndefined();
+    }
   });
 
   it("keeps the summary active when restore capability is missing or fails", async () => {
@@ -535,6 +629,174 @@ describe("memory graph correction, rollback, and rollout runtime", () => {
         (node) => node.id === failingSeed.summary.summaryId,
       )?.visibility,
     ).toBe("default");
+  });
+
+  it("replays an applied correction with its original expected version", async () => {
+    const manager = new GovernanceRuntimeTestManager();
+    const { cluster, snapshot } = await seedConsolidated(manager);
+    const command = {
+      commandId: "expected-version-replay",
+      reason: "Keep the reviewed lifecycle decision idempotent",
+      expectedVersion: snapshot.version,
+      action: {
+        type: "set-lifecycle" as const,
+        clusterId: cluster.clusterId,
+        lifecycleStatus: "active" as const,
+      },
+    };
+    const applied = await runMemoryGraphCorrection({
+      storage: manager,
+      userId: OWNER.userId,
+      command,
+    });
+    expect(applied.status).toBe("applied");
+
+    const replayed = await runMemoryGraphCorrection({
+      storage: manager,
+      userId: OWNER.userId,
+      command,
+    });
+    expect(replayed.status).toBe("replayed");
+    expect((await graph(manager)).clusters[0].lifecycleStatus).toBe("active");
+  });
+
+  it("rejects reuse of a correction command id with different content", async () => {
+    const manager = new GovernanceRuntimeTestManager();
+    const { cluster, summary, snapshot } = await seedConsolidated(manager);
+    const first = await runMemoryGraphCorrection({
+      storage: manager,
+      userId: OWNER.userId,
+      command: {
+        commandId: "stable-correction-command",
+        reason: "Apply reviewed wording",
+        expectedVersion: snapshot.version,
+        action: {
+          type: "correct-summary",
+          clusterId: cluster.clusterId,
+          summaryId: summary.summaryId,
+          correctedContent: "First reviewed wording.",
+        },
+      },
+    });
+    expect(first.status).toBe("applied");
+    const correctedSummaryId = first.summaryId ?? "";
+
+    const collision = await runMemoryGraphCorrection({
+      storage: manager,
+      userId: OWNER.userId,
+      command: {
+        commandId: "stable-correction-command",
+        reason: "Apply reviewed wording",
+        expectedVersion: snapshot.version,
+        action: {
+          type: "correct-summary",
+          clusterId: cluster.clusterId,
+          summaryId: summary.summaryId,
+          correctedContent: "Different wording under the same command id.",
+        },
+      },
+    });
+    expect(collision).toEqual(
+      expect.objectContaining({
+        status: "conflict",
+        reasonCodes: ["memory_graph_command_id_payload_conflict"],
+      }),
+    );
+    expect(manager.summaries.get(correctedSummaryId)?.summaryText).toBe(
+      "First reviewed wording.",
+    );
+  });
+
+  it("rejects correction identifiers that collide with unrelated graph state", async () => {
+    const manager = new GovernanceRuntimeTestManager();
+    const { cluster, summary } = await seedConsolidated(manager);
+    const before = await graph(manager);
+
+    const clusterCollision = await runMemoryGraphCorrection({
+      storage: manager,
+      userId: OWNER.userId,
+      command: {
+        commandId: "separated-cluster-id-collision",
+        reason: "Do not overwrite the source cluster",
+        action: {
+          type: "remove-member",
+          clusterId: cluster.clusterId,
+          nodeId: "zh-3",
+          separatedClusterId: cluster.clusterId,
+        },
+      },
+    });
+    expect(clusterCollision).toEqual(
+      expect.objectContaining({
+        status: "no-op",
+        reasonCodes: expect.arrayContaining([
+          "memory_graph_correction_separated_cluster_id_conflict",
+        ]),
+      }),
+    );
+
+    const nodeCollision = await runMemoryGraphCorrection({
+      storage: manager,
+      userId: OWNER.userId,
+      command: {
+        commandId: "corrected-summary-id-collision",
+        reason: "Do not overwrite retained raw evidence",
+        action: {
+          type: "correct-summary",
+          clusterId: cluster.clusterId,
+          summaryId: summary.summaryId,
+          correctedSummaryId: "zh-1",
+          correctedContent: "Reviewed preference.",
+        },
+      },
+    });
+    expect(nodeCollision).toEqual(
+      expect.objectContaining({
+        status: "no-op",
+        reasonCodes: expect.arrayContaining([
+          "memory_graph_correction_corrected_summary_id_conflict",
+        ]),
+      }),
+    );
+    expect(await graph(manager)).toEqual(before);
+  });
+
+  it("rejects a summary correction sourced from outside the target cluster", async () => {
+    const manager = new GovernanceRuntimeTestManager();
+    const { cluster, summary } = await seedConsolidated(manager);
+    const foreignSummaryId = "foreign-summary";
+    manager.summaries.set(foreignSummaryId, {
+      ...summary,
+      summaryId: foreignSummaryId,
+      summaryText: "Unrelated summary content.",
+    });
+
+    const result = await runMemoryGraphCorrection({
+      storage: manager,
+      userId: OWNER.userId,
+      command: {
+        commandId: "foreign-summary-correction",
+        reason: "Reject cross-cluster provenance",
+        action: {
+          type: "correct-summary",
+          clusterId: cluster.clusterId,
+          summaryId: foreignSummaryId,
+          correctedContent: "This must not become the cluster representative.",
+        },
+      },
+    });
+    expect(result).toEqual(
+      expect.objectContaining({
+        status: "no-op",
+        reasonCodes: expect.arrayContaining([
+          "memory_graph_correction_summary_not_in_cluster",
+        ]),
+      }),
+    );
+    expect(manager.summaries.size).toBe(2);
+    expect((await graph(manager)).clusters[0].representativeNodeId).toBe(
+      summary.summaryId,
+    );
   });
 
   it("rejects stale or cross-scope corrections before dependent mutation", async () => {
@@ -600,10 +862,20 @@ describe("memory graph correction, rollback, and rollout runtime", () => {
   it("exposes competing alternatives and builds rollout decisions from persisted evidence", async () => {
     const manager = new GovernanceRuntimeTestManager();
     const { cluster, summary } = await seedConsolidated(manager);
-    await runMemoryGraphCorrection({
+    await runMemoryGraphRollback({
       storage: manager,
       userId: OWNER.userId,
       now: NOW + 4000,
+      command: {
+        commandId: "evaluation-rollback",
+        reason: "Restore raw evidence",
+        summaryId: summary.summaryId,
+      },
+    });
+    await runMemoryGraphCorrection({
+      storage: manager,
+      userId: OWNER.userId,
+      now: NOW + 5000,
       command: {
         commandId: "evaluation-correction",
         reason: "Separate a polluted source",
@@ -614,17 +886,6 @@ describe("memory graph correction, rollback, and rollout runtime", () => {
         },
       },
     });
-    await runMemoryGraphRollback({
-      storage: manager,
-      userId: OWNER.userId,
-      now: NOW + 5000,
-      command: {
-        commandId: "evaluation-rollback",
-        reason: "Restore raw evidence",
-        summaryId: summary.summaryId,
-      },
-    });
-
     const blocked = await runMemoryGraphRolloutEvaluation({
       storage: manager,
       userId: OWNER.userId,
@@ -685,6 +946,11 @@ describe("memory graph correction, rollback, and rollout runtime", () => {
       [rawMessage("global-en", { relationValue: "en" })],
       NOW + 1000,
     );
+    await storeEvidence(
+      competitionManager,
+      [rawMessage("global-ja", { relationValue: "ja" })],
+      NOW + 2000,
+    );
     const competition = await graph(competitionManager);
     const conflict = buildGraphAwareRetrievalDryRun({
       ownerScope: OWNER,
@@ -695,7 +961,7 @@ describe("memory graph correction, rollback, and rollout runtime", () => {
     });
     expect(conflict.reasonCodes).toContain("competing_alternatives_exposed");
     expect(conflict.rankedNodeIds).toEqual(
-      expect.arrayContaining(["global-zh", "global-en"]),
+      expect.arrayContaining(["global-zh", "global-en", "global-ja"]),
     );
   });
 });

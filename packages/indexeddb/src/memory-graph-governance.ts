@@ -150,6 +150,41 @@ function unique(values: string[]): string[] {
   return [...new Set(values)];
 }
 
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, canonicalValue(item)]),
+  );
+}
+
+function commandFingerprint(
+  kind: "correction" | "rollback",
+  command:
+    | RawMessageMemoryGraphCorrectionCommand
+    | RawMessageMemoryGraphRollbackCommand,
+): string {
+  const payload = { ...command } as Record<string, unknown>;
+  payload.expectedVersion = undefined;
+  return JSON.stringify(canonicalValue({ kind, ...payload }));
+}
+
+function hasCommandFingerprintConflict(
+  operations: MemoryGraphOperation[],
+  commandId: string,
+  fingerprint: string,
+): boolean {
+  return operations.some(
+    (operation) =>
+      operation.metadata?.commandId === commandId &&
+      typeof operation.metadata.commandFingerprint === "string" &&
+      operation.metadata.commandFingerprint !== fingerprint,
+  );
+}
+
 function semanticResultMessageId(value: unknown): string | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   const record = value as Record<string, unknown>;
@@ -227,6 +262,40 @@ function persistenceStatus(input: {
   return input.mutatesGraph ? "applied" : "no-op";
 }
 
+function metadataStringArray(
+  metadata: Record<string, unknown> | undefined,
+  key: string,
+): string[] {
+  const value = metadata?.[key];
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+async function restoreCorrectionMessages(input: {
+  storage: RawMessageGraphGovernanceStorage;
+  userId: string;
+  messages: RawMessage[];
+}): Promise<number> {
+  if (typeof input.storage.restoreDeprecatedMessages !== "function") return 0;
+  const groups = new Map<string | undefined, string[]>();
+  for (const message of input.messages) {
+    if (message.deprecatedAt === undefined) continue;
+    const summaryId = message.supersededBySummaryId;
+    const ids = groups.get(summaryId) ?? [];
+    ids.push(message.messageId);
+    groups.set(summaryId, ids);
+  }
+  let restored = 0;
+  for (const [summaryId, messageIds] of groups) {
+    restored += await input.storage.restoreDeprecatedMessages(messageIds, {
+      userId: input.userId,
+      supersededBySummaryId: summaryId,
+    });
+  }
+  return restored;
+}
+
 export async function runMemoryGraphCorrection(input: {
   storage: RawMessageGraphGovernanceStorage;
   userId: string;
@@ -255,9 +324,32 @@ export async function runMemoryGraphCorrection(input: {
       ownerScope: scope,
       includeAuditOnly: true,
     });
+    const priorCommandOperations = await store.readAppliedOperations({
+      ownerScope: scope,
+    });
+    const fingerprint = commandFingerprint("correction", input.command);
+    if (
+      hasCommandFingerprintConflict(
+        priorCommandOperations,
+        input.command.commandId,
+        fingerprint,
+      )
+    ) {
+      return runtimeResult({
+        status: "conflict",
+        ownerScope: scope,
+        commandId: input.command.commandId,
+        graphVersion: snapshot.version,
+        reasonCodes: ["memory_graph_command_id_payload_conflict"],
+      });
+    }
+    const commandWasApplied = priorCommandOperations.some(
+      (operation) => operation.metadata?.commandId === input.command.commandId,
+    );
     if (
       input.command.expectedVersion !== undefined &&
-      input.command.expectedVersion !== (snapshot.version ?? "0")
+      input.command.expectedVersion !== (snapshot.version ?? "0") &&
+      !commandWasApplied
     ) {
       return runtimeResult({
         status: "conflict",
@@ -327,21 +419,6 @@ export async function runMemoryGraphCorrection(input: {
             reasonCodes: ["memory_graph_scope_mismatch"],
           });
         }
-        if (
-          memberMessage?.deprecatedAt !== undefined &&
-          typeof input.storage.restoreDeprecatedMessages !== "function"
-        ) {
-          return runtimeResult({
-            status: "no-op",
-            ownerScope: scope,
-            commandId: input.command.commandId,
-            graphVersion: snapshot.version,
-            reasonCodes: [
-              "adapter_missing_restore_deprecated_messages",
-              "memory_graph_correction_not_applied",
-            ],
-          });
-        }
       }
     }
 
@@ -355,33 +432,71 @@ export async function runMemoryGraphCorrection(input: {
       now,
       persistence: { mode: "write", enabled: true },
     });
+    const removeMemberOperation =
+      action.type === "remove-member"
+        ? (plan.operations.find(
+            (operation) => operation.kind === "remove-cluster-member",
+          ) ??
+          priorCommandOperations.find(
+            (operation) =>
+              operation.kind === "remove-cluster-member" &&
+              operation.metadata?.commandId === input.command.commandId,
+          ))
+        : undefined;
+    const correctionRestoreSourceIds =
+      action.type === "remove-member"
+        ? unique([
+            action.nodeId,
+            ...metadataStringArray(
+              removeMemberOperation?.metadata,
+              "restoreSourceNodeIds",
+            ),
+          ])
+        : [];
+    const correctionRestoreMessages = (
+      await Promise.all(
+        correctionRestoreSourceIds.map((messageId) =>
+          input.storage.getMessageById(messageId),
+        ),
+      )
+    ).filter(
+      (message): message is RawMessage =>
+        message !== null &&
+        sameOwnerScope(ownerScopeFromMessage(message), scope),
+    );
+    if (
+      correctionRestoreMessages.some(
+        (message) => message.deprecatedAt !== undefined,
+      ) &&
+      typeof input.storage.restoreDeprecatedMessages !== "function"
+    ) {
+      return runtimeResult({
+        status: commandWasApplied ? "partial-failure" : "no-op",
+        ownerScope: scope,
+        commandId: input.command.commandId,
+        graphVersion: snapshot.version,
+        reasonCodes: [
+          "adapter_missing_restore_deprecated_messages",
+          "memory_graph_correction_not_applied",
+        ],
+        sourceRecordIds: correctionRestoreSourceIds,
+      });
+    }
     if (plan.operations.length === 0) {
-      const priorCorrectionOperations =
-        action.type === "remove-member"
-          ? await store.readAppliedOperations({
-              ownerScope: scope,
-              nodeId: action.nodeId,
-            })
-          : [];
-      const correctionWasApplied = priorCorrectionOperations.some(
-        (operation) =>
-          operation.kind === "remove-cluster-member" &&
-          operation.metadata?.commandId === input.command.commandId,
-      );
       if (
         action.type === "remove-member" &&
-        correctionWasApplied &&
-        memberMessage?.deprecatedAt !== undefined &&
+        removeMemberOperation &&
+        correctionRestoreMessages.some(
+          (message) => message.deprecatedAt !== undefined,
+        ) &&
         typeof input.storage.restoreDeprecatedMessages === "function"
       ) {
         try {
-          const restoredRecords = await input.storage.restoreDeprecatedMessages(
-            [action.nodeId],
-            {
-              userId: scope.userId,
-              supersededBySummaryId: memberMessage.supersededBySummaryId,
-            },
-          );
+          const restoredRecords = await restoreCorrectionMessages({
+            storage: input.storage,
+            userId: scope.userId,
+            messages: correctionRestoreMessages,
+          });
           return runtimeResult({
             status: restoredRecords > 0 ? "applied" : "replayed",
             ownerScope: scope,
@@ -392,7 +507,7 @@ export async function runMemoryGraphCorrection(input: {
               ...plan.reasonCodes,
               "memory_graph_correction_restore_retried",
             ],
-            sourceRecordIds: [action.nodeId],
+            sourceRecordIds: correctionRestoreSourceIds,
           });
         } catch (error) {
           return runtimeResult({
@@ -401,7 +516,7 @@ export async function runMemoryGraphCorrection(input: {
             commandId: input.command.commandId,
             graphVersion: snapshot.version,
             reasonCodes: ["memory_graph_correction_restore_failed"],
-            sourceRecordIds: [action.nodeId],
+            sourceRecordIds: correctionRestoreSourceIds,
             error: errorInfo(error),
           });
         }
@@ -429,22 +544,28 @@ export async function runMemoryGraphCorrection(input: {
         };
       }
     }
+    for (const operation of plan.operations) {
+      operation.metadata = {
+        ...(operation.metadata ?? {}),
+        commandFingerprint: fingerprint,
+      };
+    }
     const persisted = await store.persistPlan(plan);
     let restoredRecords = 0;
     if (
       !persisted.conflict &&
       action.type === "remove-member" &&
-      memberMessage?.deprecatedAt !== undefined &&
+      correctionRestoreMessages.some(
+        (message) => message.deprecatedAt !== undefined,
+      ) &&
       typeof input.storage.restoreDeprecatedMessages === "function"
     ) {
       try {
-        restoredRecords = await input.storage.restoreDeprecatedMessages(
-          [action.nodeId],
-          {
-            userId: scope.userId,
-            supersededBySummaryId: memberMessage.supersededBySummaryId,
-          },
-        );
+        restoredRecords = await restoreCorrectionMessages({
+          storage: input.storage,
+          userId: scope.userId,
+          messages: correctionRestoreMessages,
+        });
       } catch (error) {
         return runtimeResult({
           status: "partial-failure",
@@ -456,7 +577,7 @@ export async function runMemoryGraphCorrection(input: {
             ...plan.reasonCodes,
             "memory_graph_correction_restore_failed",
           ],
-          sourceRecordIds: [action.nodeId],
+          sourceRecordIds: correctionRestoreSourceIds,
           error: errorInfo(error),
         });
       }
@@ -494,6 +615,10 @@ export async function runMemoryGraphCorrection(input: {
             : []),
         ],
         summaryId,
+        sourceRecordIds:
+          action.type === "remove-member"
+            ? correctionRestoreSourceIds
+            : undefined,
       }),
       auditTrail: audit
         ? {
@@ -534,6 +659,27 @@ function sourceIdsForSummary(
   );
 }
 
+function predecessorSummaryIdsForSummary(
+  snapshot: MemoryGraphSnapshot,
+  summaryId: string,
+): string[] {
+  const nodesById = new Map(snapshot.nodes.map((node) => [node.id, node]));
+  return unique(
+    snapshot.edges
+      .filter(
+        (edge) =>
+          edge.kind === "supersede" &&
+          edge.toNodeId === summaryId &&
+          edge.metadata?.inactive !== true,
+      )
+      .map((edge) => edge.fromNodeId)
+      .filter((nodeId) => {
+        const node = nodesById.get(nodeId);
+        return node?.type === "summary" || node?.type === "artifact";
+      }),
+  );
+}
+
 export async function runMemoryGraphRollback(input: {
   storage: RawMessageGraphGovernanceStorage;
   userId: string;
@@ -562,9 +708,33 @@ export async function runMemoryGraphRollback(input: {
       ownerScope: scope,
       includeAuditOnly: true,
     });
+    const priorCommandOperations = await store.readAppliedOperations({
+      ownerScope: scope,
+    });
+    const fingerprint = commandFingerprint("rollback", input.command);
+    if (
+      hasCommandFingerprintConflict(
+        priorCommandOperations,
+        input.command.commandId,
+        fingerprint,
+      )
+    ) {
+      return runtimeResult({
+        status: "conflict",
+        ownerScope: scope,
+        commandId: input.command.commandId,
+        graphVersion: snapshot.version,
+        reasonCodes: ["memory_graph_command_id_payload_conflict"],
+        summaryId: input.command.summaryId,
+      });
+    }
+    const commandWasApplied = priorCommandOperations.some(
+      (operation) => operation.metadata?.commandId === input.command.commandId,
+    );
     if (
       input.command.expectedVersion !== undefined &&
-      input.command.expectedVersion !== (snapshot.version ?? "0")
+      input.command.expectedVersion !== (snapshot.version ?? "0") &&
+      !commandWasApplied
     ) {
       return runtimeResult({
         status: "conflict",
@@ -580,10 +750,18 @@ export async function runMemoryGraphRollback(input: {
       nodeId: input.command.summaryId,
       includeDeprecated: true,
     });
-    const sourceRecordIds = unique([
-      ...sourceIdsForSummary(snapshot, input.command.summaryId),
-      ...existingAudit.sourceNodeIds,
-    ]);
+    const predecessorSummaryNodeIds = predecessorSummaryIdsForSummary(
+      snapshot,
+      input.command.summaryId,
+    );
+    const directSourceRecordIds = sourceIdsForSummary(
+      snapshot,
+      input.command.summaryId,
+    );
+    const sourceRecordIds =
+      predecessorSummaryNodeIds.length > 0
+        ? directSourceRecordIds
+        : unique([...directSourceRecordIds, ...existingAudit.sourceNodeIds]);
     if (sourceRecordIds.length === 0) {
       return runtimeResult({
         status: "no-op",
@@ -600,11 +778,18 @@ export async function runMemoryGraphRollback(input: {
       commandId: input.command.commandId,
       summaryId: input.command.summaryId,
       sourceNodeIds: sourceRecordIds,
+      predecessorSummaryNodeIds,
       reason: input.command.reason,
       requestedBy: input.command.requestedBy,
       now,
       persistence: { mode: "write", enabled: true },
     });
+    for (const operation of prepare.operations) {
+      operation.metadata = {
+        ...(operation.metadata ?? {}),
+        commandFingerprint: fingerprint,
+      };
+    }
     const prepared = await store.persistPlan(prepare);
     if (prepared.conflict) {
       return runtimeResult({
@@ -682,12 +867,19 @@ export async function runMemoryGraphRollback(input: {
       commandId: input.command.commandId,
       summaryId: input.command.summaryId,
       sourceNodeIds: sourceRecordIds,
+      predecessorSummaryNodeIds,
       previousLifecycleByClusterId,
       reason: input.command.reason,
       requestedBy: input.command.requestedBy,
       now,
       persistence: { mode: "write", enabled: true },
     });
+    for (const operation of finalize.operations) {
+      operation.metadata = {
+        ...(operation.metadata ?? {}),
+        commandFingerprint: fingerprint,
+      };
+    }
     const finalized = await store.persistPlan(finalize);
     const audit = await store.readAuditTrail({
       ownerScope: scope,

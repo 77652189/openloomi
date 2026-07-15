@@ -8,7 +8,10 @@ import type {
   MemoryGraphNode,
   OwnerScope,
 } from "./graph-contracts";
-import { applicabilityEquivalent } from "./graph-evolution";
+import {
+  applicabilityEquivalent,
+  buildMemoryGraphCompetitionComponents,
+} from "./graph-evolution";
 
 export interface BuildGraphAwareRetrievalDryRunInput extends GraphAwareRetrievalInput {
   maxExpandedRepresentatives?: number;
@@ -184,6 +187,7 @@ function sameApplicability(
 }
 
 function conflictAlternatives(input: {
+  ownerScope: OwnerScope;
   baselineNodeIds: string[];
   clusters: MemoryGraphClusterSnapshot[];
   edges: MemoryGraphEdge[];
@@ -193,17 +197,30 @@ function conflictAlternatives(input: {
   const touched = input.clusters.filter((cluster) =>
     clusterTouchesBaseline(cluster, baseline),
   );
+  const componentByClusterId = new Map(
+    buildMemoryGraphCompetitionComponents({
+      ownerScope: input.ownerScope,
+      clusters: input.clusters,
+      edges: input.edges,
+    }).flatMap((component) =>
+      component.clusters.map(
+        (cluster) => [cluster.clusterId, component] as const,
+      ),
+    ),
+  );
   const nodeIds: string[] = [];
   const clusterIds: string[] = [];
   for (const sourceCluster of touched) {
-    if (!sourceCluster.competitionKey) continue;
-    for (const candidate of input.clusters) {
-      if (
-        candidate.competitionKey !== sourceCluster.competitionKey ||
-        !sameApplicability(candidate, sourceCluster)
-      ) {
-        continue;
-      }
+    const component = componentByClusterId.get(sourceCluster.clusterId);
+    const candidates = component
+      ? component.clusters
+      : input.clusters.filter(
+          (candidate) =>
+            sourceCluster.competitionKey !== undefined &&
+            candidate.competitionKey === sourceCluster.competitionKey &&
+            sameApplicability(candidate, sourceCluster),
+        );
+    for (const candidate of candidates) {
       const representative = representativeForCluster(
         candidate,
         input.edges,
@@ -414,6 +431,7 @@ export function buildGraphAwareRetrievalDryRun(
   );
   const conflictExpansion = conflictMode
     ? conflictAlternatives({
+        ownerScope: input.ownerScope,
         baselineNodeIds,
         clusters,
         edges,

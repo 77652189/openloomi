@@ -21,6 +21,7 @@ import {
   createMemoryForgettingEngine,
   createMemoryQueryApi,
 } from "../../ai/src/memory";
+import { isMemorySummaryPublicationPending } from "../../ai/src/memory/summary-publication";
 import { cosineSimilarity } from "./embedding";
 import type { MemoryStage, MemorySummaryRecord, RawMessage } from "./manager";
 import {
@@ -508,19 +509,38 @@ export function createIndexedDBMemoryStorageAdapter(
 
     async querySummaries(query: MemorySummarySearchQuery) {
       const pageSize = getPageSize(query);
-      // Same `+1` strategy as raw query for consistent pagination semantics.
-      const summaries = await manager.querySummaries({
-        userId: query.userId,
-        keywords: query.keywords,
-        startTime: query.startTime,
-        endTime: query.endTime,
-        offset: query.offset,
-        pageSize: pageSize + 1,
-        reverse: query.reverse ?? true,
-        summaryTiers: query.summaryTiers,
-        dimensions: query.dimensions,
-      });
-      return hasMoreByLength(summaries.map(toMemorySummary), pageSize);
+      const requestedOffset = query.offset ?? 0;
+      const targetCount = requestedOffset + pageSize + 1;
+      const storagePageSize = Math.max(pageSize + 1, 50);
+      const published = [] as MemorySummaryRecord[];
+      let storageOffset = 0;
+
+      // Pending summaries stay durable for retries but are never default recall.
+      while (published.length < targetCount) {
+        const batch = await manager.querySummaries({
+          userId: query.userId,
+          keywords: query.keywords,
+          startTime: query.startTime,
+          endTime: query.endTime,
+          offset: storageOffset,
+          pageSize: storagePageSize,
+          reverse: query.reverse ?? true,
+          summaryTiers: query.summaryTiers,
+          dimensions: query.dimensions,
+        });
+        published.push(
+          ...batch.filter(
+            (summary) => !isMemorySummaryPublicationPending(summary),
+          ),
+        );
+        if (batch.length < storagePageSize) break;
+        storageOffset += batch.length;
+      }
+
+      return hasMoreByLength(
+        published.slice(requestedOffset).map(toMemorySummary),
+        pageSize,
+      );
     },
 
     async markRecordsAccessed(input) {

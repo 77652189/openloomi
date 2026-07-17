@@ -24,6 +24,10 @@ class GovernanceRuntimeTestManager {
   readonly summaries = new Map<string, MemorySummaryRecord>();
   nextId = 1;
   failRestoreWrites = 0;
+  noopRestoreWrites = 0;
+  failLedgerWrites = 0;
+  summaryWriteCount = 0;
+  readonly failSummaryWriteNumbers = new Set<number>();
   restoreDeprecatedMessages?: (
     messageIds: string[],
     input: { userId?: string; supersededBySummaryId?: string },
@@ -35,6 +39,10 @@ class GovernanceRuntimeTestManager {
         if (this.failRestoreWrites > 0) {
           this.failRestoreWrites -= 1;
           throw new Error("restore write failed");
+        }
+        if (this.noopRestoreWrites > 0) {
+          this.noopRestoreWrites -= 1;
+          return 0;
         }
         let changed = 0;
         for (const messageId of messageIds) {
@@ -61,6 +69,13 @@ class GovernanceRuntimeTestManager {
   }
 
   async storeMessage(message: RawMessage): Promise<number> {
+    if (
+      message.content === "OpenLoomi internal memory graph ledger" &&
+      this.failLedgerWrites > 0
+    ) {
+      this.failLedgerWrites -= 1;
+      throw new Error("ledger write failed");
+    }
     const existing = this.messages.get(message.messageId);
     const id = existing?.id ?? this.nextId++;
     this.messages.set(message.messageId, { ...message, id });
@@ -96,6 +111,10 @@ class GovernanceRuntimeTestManager {
   }
 
   async upsertSummaries(summaries: MemorySummaryRecord[]): Promise<void> {
+    this.summaryWriteCount += 1;
+    if (this.failSummaryWriteNumbers.has(this.summaryWriteCount)) {
+      throw new Error("summary write failed");
+    }
     for (const summary of summaries) {
       const existing = this.summaries.get(summary.summaryId);
       this.summaries.set(summary.summaryId, {
@@ -384,6 +403,130 @@ describe("memory graph correction, rollback, and rollout runtime", () => {
     );
   });
 
+  it("keeps a corrected summary pending until its graph commit succeeds", async () => {
+    const manager = new GovernanceRuntimeTestManager();
+    const { cluster, summary } = await seedConsolidated(manager);
+    const command = {
+      commandId: "retry-corrected-summary-publication",
+      reason: "Keep the correction hidden until graph persistence succeeds",
+      action: {
+        type: "correct-summary" as const,
+        clusterId: cluster.clusterId,
+        summaryId: summary.summaryId,
+        correctedSummaryId: "pending-corrected-summary",
+        correctedContent: "The user prefers Chinese responses after review.",
+      },
+    };
+
+    manager.failLedgerWrites = 1;
+    const failed = await runMemoryGraphCorrection({
+      storage: manager,
+      userId: OWNER.userId,
+      now: NOW + 4000,
+      command,
+    });
+    expect(failed.status).toBe("failed");
+    const pendingRecall = await queryMemoryWithFallback(manager as never, {
+      userId: OWNER.userId,
+      limit: 10,
+      minRawResultsWithoutFallback: 10,
+    });
+    expect(
+      pendingRecall.items.some(
+        (item) =>
+          item.sourceType === "summary" &&
+          item.summary.summaryId === "pending-corrected-summary",
+      ),
+    ).toBe(false);
+
+    const retried = await runMemoryGraphCorrection({
+      storage: manager,
+      userId: OWNER.userId,
+      now: NOW + 5000,
+      command,
+    });
+    expect(retried.status).toBe("applied");
+    const publishedRecall = await queryMemoryWithFallback(manager as never, {
+      userId: OWNER.userId,
+      limit: 10,
+      minRawResultsWithoutFallback: 10,
+    });
+    expect(
+      publishedRecall.items.some(
+        (item) =>
+          item.sourceType === "summary" &&
+          item.summary.summaryId === "pending-corrected-summary",
+      ),
+    ).toBe(true);
+  });
+
+  it("retries corrected summary publication after its graph commit", async () => {
+    const manager = new GovernanceRuntimeTestManager();
+    const { cluster, summary } = await seedConsolidated(manager);
+    const command = {
+      commandId: "retry-corrected-summary-after-graph-commit",
+      reason: "Keep the correction pending until the summary publish retry",
+      action: {
+        type: "correct-summary" as const,
+        clusterId: cluster.clusterId,
+        summaryId: summary.summaryId,
+        correctedSummaryId: "publish-after-graph-retry",
+        correctedContent: "The reviewed preference is Chinese responses.",
+      },
+    };
+
+    manager.failSummaryWriteNumbers.add(manager.summaryWriteCount + 2);
+    const failed = await runMemoryGraphCorrection({
+      storage: manager,
+      userId: OWNER.userId,
+      now: NOW + 4000,
+      command,
+    });
+    expect(failed).toEqual(
+      expect.objectContaining({
+        status: "partial-failure",
+        reasonCodes: expect.arrayContaining([
+          "memory_graph_corrected_summary_publication_failed",
+        ]),
+      }),
+    );
+    expect((await graph(manager)).clusters[0].representativeNodeId).toBe(
+      "publish-after-graph-retry",
+    );
+    const pendingRecall = await queryMemoryWithFallback(manager as never, {
+      userId: OWNER.userId,
+      limit: 10,
+      minRawResultsWithoutFallback: 10,
+    });
+    expect(
+      pendingRecall.items.some(
+        (item) =>
+          item.sourceType === "summary" &&
+          item.summary.summaryId === "publish-after-graph-retry",
+      ),
+    ).toBe(false);
+
+    const retried = await runMemoryGraphCorrection({
+      storage: manager,
+      userId: OWNER.userId,
+      now: NOW + 5000,
+      command,
+    });
+    expect(retried.status).toBe("replayed");
+    const publishedRecall = await queryMemoryWithFallback(manager as never, {
+      userId: OWNER.userId,
+      limit: 10,
+      minRawResultsWithoutFallback: 10,
+    });
+    expect(
+      publishedRecall.items.some(
+        (item) =>
+          item.sourceType === "summary" &&
+          item.summary.summaryId === "publish-after-graph-retry",
+      ),
+    ).toBe(true);
+  });
+
   it("applies explicit lifecycle and preferred-representative corrections", async () => {
     const manager = new GovernanceRuntimeTestManager();
     const { cluster, summary } = await seedConsolidated(manager);
@@ -629,6 +772,48 @@ describe("memory graph correction, rollback, and rollout runtime", () => {
         (node) => node.id === failingSeed.summary.summaryId,
       )?.visibility,
     ).toBe("default");
+  });
+
+  it("does not retire the representative when raw restoration makes no progress", async () => {
+    const manager = new GovernanceRuntimeTestManager();
+    const { summary } = await seedConsolidated(manager);
+    const command = {
+      commandId: "rollback-silent-noop-adapter",
+      reason: "Do not retire the representative until raw records are visible",
+      summaryId: summary.summaryId,
+    };
+    manager.noopRestoreWrites = 1;
+
+    const blocked = await runMemoryGraphRollback({
+      storage: manager,
+      userId: OWNER.userId,
+      now: NOW + 4000,
+      command,
+    });
+    expect(blocked).toEqual(
+      expect.objectContaining({
+        status: "partial-failure",
+        reasonCodes: ["memory_graph_rollback_source_restore_incomplete"],
+      }),
+    );
+    expect(
+      (await graph(manager)).nodes.find((node) => node.id === summary.summaryId)
+        ?.visibility,
+    ).toBe("default");
+    expect(manager.messages.get("zh-1")?.deprecatedAt).toBeDefined();
+
+    const retried = await runMemoryGraphRollback({
+      storage: manager,
+      userId: OWNER.userId,
+      now: NOW + 5000,
+      command,
+    });
+    expect(retried.status).toBe("applied");
+    expect(
+      (await graph(manager)).nodes.find((node) => node.id === summary.summaryId)
+        ?.visibility,
+    ).toBe("audit-only");
+    expect(manager.messages.get("zh-1")?.deprecatedAt).toBeUndefined();
   });
 
   it("replays an applied correction with its original expected version", async () => {

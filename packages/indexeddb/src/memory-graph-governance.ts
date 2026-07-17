@@ -18,6 +18,10 @@ import {
   sameOwnerScope,
 } from "../../ai/memory-consolidation/src";
 import {
+  publishMemorySummary,
+  stageMemorySummaryPublication,
+} from "../../ai/src/memory/summary-publication";
+import {
   type RawMessageGraphEvolutionStorage,
   createRawMessageMemoryGraphStore,
   ownerScopeFromMessage,
@@ -390,13 +394,13 @@ export async function runMemoryGraphCorrection(input: {
       summaryId =
         correction.correctedSummaryId ??
         correctedSummaryId(scope, input.command.commandId);
-      correctedSummary = {
+      correctedSummary = stageMemorySummaryPublication({
         ...oldSummary,
         summaryId,
         summaryText: correction.correctedContent,
         updatedAt: now,
         createdAt: now,
-      };
+      });
       action = {
         type: "correct-summary",
         clusterId: correction.clusterId,
@@ -521,6 +525,34 @@ export async function runMemoryGraphCorrection(input: {
           });
         }
       }
+      if (correctedSummary && commandWasApplied) {
+        try {
+          await input.storage.upsertSummaries([
+            publishMemorySummary(correctedSummary),
+          ]);
+          return runtimeResult({
+            status: "replayed",
+            ownerScope: scope,
+            commandId: input.command.commandId,
+            graphVersion: snapshot.version,
+            reasonCodes: [
+              ...plan.reasonCodes,
+              "memory_graph_corrected_summary_publication_retried",
+            ],
+            summaryId,
+          });
+        } catch (error) {
+          return runtimeResult({
+            status: "partial-failure",
+            ownerScope: scope,
+            commandId: input.command.commandId,
+            graphVersion: snapshot.version,
+            reasonCodes: ["memory_graph_corrected_summary_publication_failed"],
+            summaryId,
+            error: errorInfo(error),
+          });
+        }
+      }
       return runtimeResult({
         status: "no-op",
         ownerScope: scope,
@@ -551,6 +583,27 @@ export async function runMemoryGraphCorrection(input: {
       };
     }
     const persisted = await store.persistPlan(plan);
+    if (correctedSummary && !persisted.conflict) {
+      try {
+        await input.storage.upsertSummaries([
+          publishMemorySummary(correctedSummary),
+        ]);
+      } catch (error) {
+        return runtimeResult({
+          status: "partial-failure",
+          ownerScope: scope,
+          commandId: input.command.commandId,
+          graphVersion: persisted.version,
+          operations: persisted.appliedOperations,
+          reasonCodes: [
+            ...plan.reasonCodes,
+            "memory_graph_corrected_summary_publication_failed",
+          ],
+          summaryId,
+          error: errorInfo(error),
+        });
+      }
+    }
     let restoredRecords = 0;
     if (
       !persisted.conflict &&
@@ -837,6 +890,30 @@ export async function runMemoryGraphRollback(input: {
         summaryId: input.command.summaryId,
         sourceRecordIds,
         error: errorInfo(error),
+      });
+    }
+    const restoredSources = await Promise.all(
+      sourceRecordIds.map((messageId) =>
+        input.storage.getMessageById(messageId),
+      ),
+    );
+    const incompleteSourceRestore = restoredSources.some(
+      (message) =>
+        message === null ||
+        !sameOwnerScope(ownerScopeFromMessage(message), scope) ||
+        message.deprecatedAt !== undefined,
+    );
+    if (incompleteSourceRestore) {
+      return runtimeResult({
+        status: "partial-failure",
+        ownerScope: scope,
+        commandId: input.command.commandId,
+        graphVersion: prepared.version,
+        operations: prepared.appliedOperations,
+        restoredRecords,
+        reasonCodes: ["memory_graph_rollback_source_restore_incomplete"],
+        summaryId: input.command.summaryId,
+        sourceRecordIds,
       });
     }
 

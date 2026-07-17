@@ -78,6 +78,7 @@ export interface SQLiteRawMessageSemanticSearchInput {
   scanLimit?: number;
   threshold?: number;
   includeArchived?: boolean;
+  includeDeprecated?: boolean;
   platform?: string;
   botId?: string;
   channel?: string;
@@ -847,6 +848,36 @@ export class SQLiteRawMessageManager implements RawMessageStorageManager {
     return result.changes;
   }
 
+  async restoreDeprecatedMessages(
+    messageIds: string[],
+    input: { userId?: string; supersededBySummaryId?: string } = {},
+  ): Promise<number> {
+    await this.init();
+    if (messageIds.length === 0) return 0;
+    const placeholders = messageIds.map(() => "?").join(",");
+    const userClause = input.userId ? "AND user_id = ?" : "";
+    const summaryClause = input.supersededBySummaryId
+      ? "AND superseded_by_summary_id = ?"
+      : "";
+    const result = this.db
+      .prepare(
+        `UPDATE raw_messages
+            SET deprecated_at = NULL,
+                deprecation_reason = NULL,
+                superseded_by_summary_id = NULL
+          WHERE message_id IN (${placeholders})
+            AND deprecated_at IS NOT NULL
+            ${userClause}
+            ${summaryClause}`,
+      )
+      .run(
+        ...messageIds,
+        ...(input.userId ? [input.userId] : []),
+        ...(input.supersededBySummaryId ? [input.supersededBySummaryId] : []),
+      );
+    return result.changes;
+  }
+
   async hardDeleteArchived(
     olderThan: number,
     userId?: string,
@@ -1290,6 +1321,7 @@ export class SQLiteRawMessageManager implements RawMessageStorageManager {
     return this.queryMessagesSync({
       userId: input.userId,
       includeArchived: input.includeArchived ?? false,
+      includeDeprecated: input.includeDeprecated ?? false,
       reverse: true,
       pageSize: scanLimit,
       platform: input.platform,
@@ -1334,6 +1366,9 @@ export class SQLiteRawMessageManager implements RawMessageStorageManager {
       return false;
     }
     if (!input.includeArchived && message.archivedAt !== undefined) {
+      return false;
+    }
+    if (!input.includeDeprecated && message.deprecatedAt !== undefined) {
       return false;
     }
     if (

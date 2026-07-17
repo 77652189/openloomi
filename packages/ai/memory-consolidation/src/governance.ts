@@ -306,7 +306,23 @@ export interface BuildMemoryGraphRolloutGovernanceReportInput {
   semanticRetrievalScenarios?: MemorySemanticRetrievalEvalScenarioReport[];
   auditScenarioReport?: MemoryGovernanceAuditScenarioReport;
   commandReport?: MemoryGovernanceCommandDryRunReport;
+  runtimeEvidence?: MemoryGraphRolloutRuntimeEvidence;
   thresholds?: MemoryGraphRolloutGateThresholds;
+  metadata?: Record<string, unknown>;
+}
+
+export interface MemoryGraphRolloutRuntimeEvidence {
+  ownerScopeKey: string;
+  snapshotVersion?: string;
+  operationIds: string[];
+  correctionOperationIds: string[];
+  rollbackOperationIds: string[];
+  defaultRetrievedNodeIds: string[];
+  auditRetrievedNodeIds: string[];
+  semanticDefaultRecordIds: string[];
+  semanticAuditRecordIds: string[];
+  sourceRecordIds: string[];
+  summaryIds: string[];
   metadata?: Record<string, unknown>;
 }
 
@@ -698,9 +714,11 @@ export function buildMemoryGraphRolloutGovernanceReport(
 
   if (thresholds.requireCorrectionCommand) {
     const validCorrectionCount =
+      input.runtimeEvidence?.correctionOperationIds.length ??
       input.commandReport?.commands.filter(
         (command) => command.type === "correct-content" && command.valid,
-      ).length ?? 0;
+      ).length ??
+      0;
     gates.push(
       buildGate({
         gateId: "governance.correction-command",
@@ -715,9 +733,11 @@ export function buildMemoryGraphRolloutGovernanceReport(
 
   if (thresholds.requireRollbackCommand) {
     const validRollbackCount =
+      input.runtimeEvidence?.rollbackOperationIds.length ??
       input.commandReport?.commands.filter(
         (command) => command.type === "rollback-artifact" && command.valid,
-      ).length ?? 0;
+      ).length ??
+      0;
     gates.push(
       buildGate({
         gateId: "governance.rollback-command",
@@ -763,7 +783,23 @@ export function buildMemoryGraphRolloutGovernanceReport(
       ...(input.auditScenarioReport?.reasonCodes ?? []),
       ...(input.commandReport?.reasonCodes ?? []),
     ]),
-    metadata: copyMetadata(input.metadata),
+    metadata: {
+      ...(copyMetadata(input.metadata) ?? {}),
+      ...(input.runtimeEvidence
+        ? {
+            runtimeEvidence: {
+              ...input.runtimeEvidence,
+              operationIds: [...input.runtimeEvidence.operationIds],
+              correctionOperationIds: [
+                ...input.runtimeEvidence.correctionOperationIds,
+              ],
+              rollbackOperationIds: [
+                ...input.runtimeEvidence.rollbackOperationIds,
+              ],
+            },
+          }
+        : {}),
+    },
   };
 }
 

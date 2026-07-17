@@ -22,6 +22,10 @@ import {
 } from "../../ai/src/memory";
 import type { RawMessage } from "./manager";
 import {
+  publishMemorySummary,
+  stageMemorySummaryPublication,
+} from "../../ai/src/memory/summary-publication";
+import {
   createRawMessageMemoryGraphStore,
   ownerScopeFromMessage,
 } from "./memory-graph-evolution";
@@ -414,12 +418,14 @@ export async function runMemoryGraphLifecycleCycle(
       }
 
       try {
-        const summary = await buildSummary({
-          ownerScope,
-          clusterId: candidate.clusterId,
-          messages: sourceMessages,
-          now,
-        });
+        const summary = stageMemorySummaryPublication(
+          await buildSummary({
+            ownerScope,
+            clusterId: candidate.clusterId,
+            messages: sourceMessages,
+            now,
+          }),
+        );
         await input.storage.saveSummaries([summary]);
         createdSummaries += 1;
 
@@ -495,6 +501,7 @@ export async function runMemoryGraphLifecycleCycle(
           reasonCodes.add("memory_graph_representative_not_persisted");
           continue;
         }
+        await input.storage.saveSummaries([publishMemorySummary(summary)]);
         const supersededSourceGroups = sourceIdsForClusters(
           snapshot,
           candidate.supersededClusterIds,

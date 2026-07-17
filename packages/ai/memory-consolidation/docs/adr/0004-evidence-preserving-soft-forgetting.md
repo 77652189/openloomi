@@ -19,6 +19,11 @@ A summary or artifact may become the active representative only after successful
 persistence with provenance. Covered raw records may then be soft-deprecated and
 hidden from default retrieval while remaining available to audit and correction.
 
+Superseding a represented cluster also moves its previous representative out of
+default retrieval while retaining a provenance edge to the new representative.
+A rollback or membership correction restores the required raw evidence and any
+valid predecessor representative before retiring the invalid representative.
+
 Hard deletion is outside Memory Graph Evolution.
 
 ## Consequences

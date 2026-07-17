@@ -259,4 +259,21 @@ describe("postgres raw message deprecation", () => {
     expect(setArg?.deprecationReason).toBeNull();
     expect(setArg?.supersededBySummaryId).toBeNull();
   });
+
+  it("restores only records still superseded by the targeted summary", async () => {
+    const { db, updateChain } = createUpdateDb([{ id: 1 }, { id: 2 }]);
+    const manager = new PostgresRawMessageManager(db as never);
+    const affected = await manager.restoreDeprecatedMessages(
+      ["msg-1", "msg-2"],
+      { userId, supersededBySummaryId: "summary-1" },
+    );
+
+    expect(affected).toBe(2);
+    expect(updateChain.set).toHaveBeenCalledWith({
+      deprecatedAt: null,
+      deprecationReason: null,
+      supersededBySummaryId: null,
+    });
+    expect(updateChain.where).toHaveBeenCalledTimes(1);
+  });
 });

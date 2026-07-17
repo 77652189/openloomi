@@ -19,6 +19,8 @@ class GraphLifecycleTestManager {
   readonly summaries = new Map<string, MemorySummaryRecord>();
   nextId = 1;
   failSummaryWrites = 0;
+  summaryWriteCount = 0;
+  readonly failSummaryWriteNumbers = new Set<number>();
   failDeprecationWrites = 0;
   ledgerWriteCount = 0;
   readonly failLedgerWriteNumbers = new Set<number>();
@@ -115,6 +117,10 @@ class GraphLifecycleTestManager {
   }
 
   async upsertSummaries(summaries: MemorySummaryRecord[]): Promise<void> {
+    this.summaryWriteCount += 1;
+    if (this.failSummaryWriteNumbers.has(this.summaryWriteCount)) {
+      throw new Error("summary write failed");
+    }
     if (this.failSummaryWrites > 0) {
       this.failSummaryWrites -= 1;
       throw new Error("summary write failed");
@@ -135,6 +141,10 @@ class GraphLifecycleTestManager {
     return [...this.summaries.values()]
       .filter((summary) => !input.userId || summary.userId === input.userId)
       .slice(0, input.pageSize);
+  }
+
+  async markMessagesAccessed(): Promise<number> {
+    return 0;
   }
 
   async hardDeleteArchived(): Promise<number> {
@@ -349,12 +359,104 @@ describe("memory graph lifecycle forgetting runtime", () => {
 
     expect(result.graphLifecycle?.status).toBe("partial-failure");
     expect(manager.summaries.size).toBe(1);
+    const pendingRecall = await queryMemoryWithFallback(manager as never, {
+      userId: OWNER.userId,
+      limit: 10,
+      minRawResultsWithoutFallback: 10,
+    });
+    expect(pendingRecall.items.map((item) => item.sourceType)).toEqual([
+      "raw",
+      "raw",
+      "raw",
+    ]);
     expect(
       manager.messages.get("representative-fail-1")?.deprecatedAt,
     ).toBeUndefined();
     expect(
       (await snapshot(manager)).clusters[0].representativeNodeId,
     ).toBeUndefined();
+
+    const retried = await runMemoryForgettingCycle(
+      manager as never,
+      OWNER.userId,
+      { now: NOW + 4000, graphLifecycle: { enabled: true } },
+    );
+    expect(retried.graphLifecycle?.status).toBe("applied");
+    const publishedRecall = await queryMemoryWithFallback(manager as never, {
+      userId: OWNER.userId,
+      limit: 10,
+      minRawResultsWithoutFallback: 10,
+    });
+    expect(publishedRecall.items).toEqual([
+      expect.objectContaining({
+        sourceType: "summary",
+        summary: expect.objectContaining({ summaryId: expect.any(String) }),
+      }),
+    ]);
+  });
+
+  it("retries a final summary publication failure before deprecating sources", async () => {
+    const manager = new GraphLifecycleTestManager();
+    await storeEvidence(manager, [rawMessage("publication-fail-1")]);
+    await storeEvidence(manager, [rawMessage("publication-fail-2")], {
+      now: NOW + 1000,
+    });
+    await storeEvidence(manager, [rawMessage("publication-fail-3")], {
+      now: NOW + 2000,
+    });
+    // The staged write succeeds; the publish write after graph persistence fails.
+    manager.failSummaryWriteNumbers.add(2);
+
+    const failed = await runMemoryForgettingCycle(
+      manager as never,
+      OWNER.userId,
+      { now: NOW + 3000, graphLifecycle: { enabled: true } },
+    );
+
+    expect(failed.graphLifecycle?.status).toBe("partial-failure");
+    const pendingSummary = [...manager.summaries.values()][0];
+    expect(pendingSummary?.dimensions).toEqual(
+      expect.objectContaining({ __openloomiMemoryPublication: "pending" }),
+    );
+    expect(
+      manager.messages.get("publication-fail-1")?.deprecatedAt,
+    ).toBeUndefined();
+    const pendingRecall = await queryMemoryWithFallback(manager as never, {
+      userId: OWNER.userId,
+      limit: 10,
+      minRawResultsWithoutFallback: 10,
+    });
+    expect(pendingRecall.items.map((item) => item.sourceType)).toEqual([
+      "raw",
+      "raw",
+      "raw",
+    ]);
+
+    const retried = await runMemoryForgettingCycle(
+      manager as never,
+      OWNER.userId,
+      { now: NOW + 4000, graphLifecycle: { enabled: true } },
+    );
+
+    expect(retried.graphLifecycle?.status).toBe("applied");
+    expect(manager.summaries.size).toBe(1);
+    expect([...manager.summaries.values()][0]?.dimensions).not.toEqual(
+      expect.objectContaining({ __openloomiMemoryPublication: "pending" }),
+    );
+    expect(manager.messages.get("publication-fail-1")?.deprecatedAt).toBe(
+      NOW + 4000,
+    );
+    const publishedRecall = await queryMemoryWithFallback(manager as never, {
+      userId: OWNER.userId,
+      limit: 10,
+      minRawResultsWithoutFallback: 10,
+    });
+    expect(publishedRecall.items).toEqual([
+      expect.objectContaining({
+        sourceType: "summary",
+        summary: expect.objectContaining({ summaryId: expect.any(String) }),
+      }),
+    ]);
   });
 
   it("retries a partial deprecation failure without duplicating the summary", async () => {

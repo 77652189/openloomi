@@ -111,6 +111,11 @@ The capability includes:
 
 ## PR 3: Correction, Evaluation, and Controlled Rollout
 
+Implementation status: runtime correction, rollback, recursive audit,
+conflict-sensitive retrieval, and persisted-evidence rollout evaluation are
+implemented on the stacked PR 3 branch. Broader rollout remains governed by the
+required gates below.
+
 ### Functional Outcome
 
 Automatic evolution can be inspected, corrected, rolled back, evaluated, and

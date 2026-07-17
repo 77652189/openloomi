@@ -103,6 +103,11 @@ relations. It owns:
 Related evidence does not automatically become cluster membership. Competing
 clusters remain distinct.
 
+The effective competition group is the connected component formed by active
+`compete` edges within the same owner scope and exact applicability identity.
+The single `competitionKey` field is diagnostic metadata, not the authoritative
+grouping model.
+
 ### Cluster Lifecycle
 
 The lifecycle states are:
@@ -321,6 +326,11 @@ affected cluster snapshot
 ```
 
 Source visibility changes occur only after representative persistence succeeds.
+When one represented cluster supersedes another, the previous representative
+becomes audit-only and links to the new representative through a `supersede`
+edge. Rollback retires the new representative only after raw visibility and raw
+storage deprecation have been restored, then restores any predecessor
+representative.
 
 ### Retrieval
 
@@ -353,6 +363,11 @@ memory or cluster
 A correction adds an authoritative operation; it does not rewrite historical
 evidence.
 
+Removing an incorrectly merged member invalidates a representative that covered
+that member. The representative becomes audit-only, its covered raw evidence is
+restored, predecessor representatives are restored when present, and affected
+support or supersession edges become inactive without being deleted.
+
 ## Failure and Degradation Rules
 
 - Missing graph snapshot: keep baseline behavior and report a no-op.
@@ -383,13 +398,14 @@ Already available:
 - deprecated-record filtering and `includeDeprecated` audit retrieval
 - graph-aware filtering and ranking of baseline retrieval candidates
 - relation observations and competition-oriented diagnostics
+- persisted owner-scoped graph evolution and cluster lifecycle decisions
+- lifecycle-driven summary persistence and source soft-deprecation
+- explicit correction, rollback, recursive audit, and runtime rollout evidence
 
-Next architecture gap:
+Remaining rollout boundary:
 
-- ingest-time interaction that updates durable graph relations and clusters
-- lifecycle decisions driven by accumulated graph evidence
-- consolidation and weakening driven by lifecycle state
-- explicit correction and rollback of graph evolution
+- broader automatic enablement remains blocked until required runtime evaluation
+  artifacts pass the rollout governance gates
 
 ## PR Reference Contract
 

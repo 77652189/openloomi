@@ -30,7 +30,7 @@ export interface RawMessage {
   embeddingContentHash?: string;
   embeddingDimensions?: number;
   embeddingUpdatedAt?: number;
-  metadata?: Record<string, any>;
+  metadata?: Record<string, unknown>;
   createdAt: number;
   memoryStage?: MemoryStage;
   accessCount?: number;
@@ -173,6 +173,14 @@ export interface RawMessageStorage {
       userId?: string;
       deprecatedAt?: number;
       reason?: string;
+      supersededBySummaryId?: string;
+    },
+  ): Promise<number>;
+  /** Restore only records still deprecated by the targeted summary. */
+  restoreDeprecatedMessages?(
+    messageIds: string[],
+    input: {
+      userId?: string;
       supersededBySummaryId?: string;
     },
   ): Promise<number>;

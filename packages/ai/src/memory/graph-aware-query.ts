@@ -271,7 +271,11 @@ export async function applyGraphAwareRetrieval(input: {
       query: (options.queryText ?? defaultGraphQueryText)(input.query),
       baselineNodeIds,
       snapshot,
-      visibilityMode: input.query.includeDeprecated ? "audit" : "default",
+      visibilityMode: input.query.conflictSensitive
+        ? "conflict"
+        : input.query.includeDeprecated
+          ? "audit"
+          : "default",
       includeDeprecated: input.query.includeDeprecated,
       metadata: {
         source: "memory_query_api",

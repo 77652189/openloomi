@@ -1,6 +1,25 @@
 import "server-only";
 
+import { getDb, initDb, isDbInitialized } from "@/lib/db/adapters";
 import {
+  type MemorySummaryRow,
+  type RawMessageRow,
+  memorySummaries,
+  rawMessages,
+} from "@/lib/db/schema.pg";
+import { isTauriMode } from "@/lib/env/constants";
+import type {
+  MemoryStage,
+  MemorySummaryQuery,
+  MemorySummaryRecord,
+  RawMessage,
+  RawMessageEmbeddingUpdate,
+  RawMessageQuery,
+  RawMessageStats,
+  RawMessageStorageManager,
+} from "@openloomi/indexeddb/storage";
+import {
+  type SQL,
   and,
   asc,
   count,
@@ -15,26 +34,7 @@ import {
   min,
   or,
   sql,
-  type SQL,
 } from "drizzle-orm";
-import { getDb, initDb, isDbInitialized } from "@/lib/db/adapters";
-import {
-  memorySummaries,
-  rawMessages,
-  type MemorySummaryRow,
-  type RawMessageRow,
-} from "@/lib/db/schema.pg";
-import { isTauriMode } from "@/lib/env/constants";
-import type {
-  MemoryStage,
-  MemorySummaryQuery,
-  MemorySummaryRecord,
-  RawMessage,
-  RawMessageEmbeddingUpdate,
-  RawMessageQuery,
-  RawMessageStats,
-  RawMessageStorageManager,
-} from "@openloomi/indexeddb/storage";
 
 interface PostgresRawMessageSemanticSearchInput {
   userId: string;
@@ -44,6 +44,7 @@ interface PostgresRawMessageSemanticSearchInput {
   scanLimit?: number;
   threshold?: number;
   includeArchived?: boolean;
+  includeDeprecated?: boolean;
   platform?: string;
   botId?: string;
   channel?: string;
@@ -712,6 +713,34 @@ export class PostgresRawMessageManager implements RawMessageStorageManager {
     return rows.length;
   }
 
+  async restoreDeprecatedMessages(
+    messageIds: string[],
+    input: { userId?: string; supersededBySummaryId?: string } = {},
+  ): Promise<number> {
+    if (messageIds.length === 0) return 0;
+    const db = await this.getDatabase();
+    const conditions = [
+      inArray(rawMessages.messageId, messageIds),
+      isNotNull(rawMessages.deprecatedAt),
+    ];
+    if (input.userId) conditions.push(eq(rawMessages.userId, input.userId));
+    if (input.supersededBySummaryId) {
+      conditions.push(
+        eq(rawMessages.supersededBySummaryId, input.supersededBySummaryId),
+      );
+    }
+    const rows = await db
+      .update(rawMessages)
+      .set({
+        deprecatedAt: null,
+        deprecationReason: null,
+        supersededBySummaryId: null,
+      })
+      .where(and(...conditions))
+      .returning({ id: rawMessages.id });
+    return rows.length;
+  }
+
   async hardDeleteArchived(
     olderThan: number,
     userId?: string,
@@ -786,6 +815,7 @@ export class PostgresRawMessageManager implements RawMessageStorageManager {
       startTime: input.startTime,
       endTime: input.endTime,
       includeArchived: input.includeArchived,
+      includeDeprecated: input.includeDeprecated,
     });
     conditions.push(isNotNull(rawMessages.embedding));
     if (input.embeddingModel) {

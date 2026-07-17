@@ -97,7 +97,11 @@ export type MemoryGraphOperationKind =
   | "upsert-cluster"
   | "set-cluster-lifecycle"
   | "set-cluster-representative"
-  | "supersede-node";
+  | "supersede-node"
+  | "correct-node"
+  | "remove-cluster-member"
+  | "restore-node"
+  | "rollback-supersession";
 
 export interface MemoryGraphOperation {
   operationId: string;
@@ -173,6 +177,10 @@ export interface MemoryGraphStore {
   readSnapshot(query: MemoryGraphSnapshotQuery): Promise<MemoryGraphSnapshot>;
   persistPlan(plan: MemoryGraphUpdatePlan): Promise<MemoryGraphUpdateResult>;
   readAuditTrail(query: MemoryGraphAuditQuery): Promise<MemoryGraphAuditTrail>;
+  readAppliedOperations(query: {
+    ownerScope: OwnerScope;
+    nodeId?: string;
+  }): Promise<MemoryGraphOperation[]>;
 }
 
 export interface GraphInteractionInput {
@@ -261,7 +269,7 @@ export interface MemoryConsolidationPlanner {
   ): Promise<MemoryGraphConsolidationPlan>;
 }
 
-export type GraphRetrievalVisibilityMode = "default" | "audit";
+export type GraphRetrievalVisibilityMode = "default" | "audit" | "conflict";
 
 export interface GraphAwareRetrievalInput {
   ownerScope: OwnerScope;

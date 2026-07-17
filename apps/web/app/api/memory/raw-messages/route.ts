@@ -8,6 +8,8 @@ import {
 import type {
   MemorySummaryRecord,
   RawMessage,
+  RawMessageMemoryGraphCorrectionCommand,
+  RawMessageMemoryGraphRollbackCommand,
   RawMessageQuery,
   RunMemoryForgettingCycleSerializableShadowDiagnosticsOptions,
 } from "@openloomi/indexeddb";
@@ -16,6 +18,9 @@ import {
   parseRawMessageGraphLifecycleOptions,
   queryMemoryWithFallback,
   runMemoryForgettingCycle,
+  runMemoryGraphCorrection,
+  runMemoryGraphRollback,
+  runMemoryGraphRolloutEvaluation,
   storeRawMessagesWithGraphEvolution,
 } from "@openloomi/indexeddb";
 import { AppError } from "@openloomi/shared/errors";
@@ -39,6 +44,68 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function optionalBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
+}
+
+function isGraphCommandBase(value: unknown): value is Record<
+  string,
+  unknown
+> & {
+  commandId: string;
+  reason: string;
+} {
+  return (
+    isRecord(value) &&
+    typeof value.commandId === "string" &&
+    value.commandId.trim().length > 0 &&
+    typeof value.reason === "string" &&
+    value.reason.trim().length > 0
+  );
+}
+
+function isGraphCorrectionCommand(value: unknown): boolean {
+  if (!isGraphCommandBase(value) || !isRecord(value.action)) return false;
+  const action = value.action;
+  if (typeof action.clusterId !== "string") return false;
+  switch (action.type) {
+    case "correct-summary":
+      return (
+        typeof action.summaryId === "string" &&
+        typeof action.correctedContent === "string" &&
+        (action.correctedSummaryId === undefined ||
+          typeof action.correctedSummaryId === "string")
+      );
+    case "set-lifecycle":
+      return [
+        "forming",
+        "active",
+        "stable",
+        "decaying",
+        "superseded",
+        "audit-only",
+      ].includes(String(action.lifecycleStatus));
+    case "remove-member":
+      return typeof action.nodeId === "string";
+    case "set-representative":
+      return typeof action.representativeNodeId === "string";
+    default:
+      return false;
+  }
+}
+
+function isGraphRollbackCommand(value: unknown): boolean {
+  return isGraphCommandBase(value) && typeof value.summaryId === "string";
+}
+
+function withoutClientOwnerScope(
+  command: Record<string, unknown>,
+): Record<string, unknown> {
+  const {
+    userId: _userId,
+    workspaceId: _workspaceId,
+    tenantId: _tenantId,
+    ...serverScopedCommand
+  } = command;
+  return serverScopedCommand;
 }
 
 function optionalFiniteNumber(value: unknown): number | undefined {
@@ -425,6 +492,68 @@ export async function POST(request: NextRequest) {
           userId,
           parseForgettingCycleOptions(body.options),
         );
+        return Response.json({ success: true, result });
+      }
+
+      case "graphCorrection": {
+        if (!isGraphCorrectionCommand(body.command)) {
+          return new AppError(
+            "bad_request:api",
+            "command object is required",
+          ).toResponse();
+        }
+        const command = withoutClientOwnerScope(
+          body.command as Record<string, unknown>,
+        );
+        const result = await runMemoryGraphCorrection({
+          storage: manager,
+          userId,
+          command: command as unknown as RawMessageMemoryGraphCorrectionCommand,
+        });
+        return Response.json({ success: true, result });
+      }
+
+      case "graphRollback": {
+        if (!isGraphRollbackCommand(body.command)) {
+          return new AppError(
+            "bad_request:api",
+            "command object is required",
+          ).toResponse();
+        }
+        const command = withoutClientOwnerScope(
+          body.command as Record<string, unknown>,
+        );
+        const result = await runMemoryGraphRollback({
+          storage: manager,
+          userId,
+          command: command as unknown as RawMessageMemoryGraphRollbackCommand,
+        });
+        return Response.json({ success: true, result });
+      }
+
+      case "graphRolloutEvaluation": {
+        const options = isRecord(body.options) ? body.options : {};
+        const result = await runMemoryGraphRolloutEvaluation({
+          storage: manager,
+          userId,
+          scenarioId:
+            typeof options.scenarioId === "string"
+              ? options.scenarioId
+              : "memory-graph-runtime-rollout",
+          workspaceId: undefined,
+          tenantId: undefined,
+          queryEmbedding: Array.isArray(options.queryEmbedding)
+            ? options.queryEmbedding.filter(
+                (value: unknown): value is number =>
+                  typeof value === "number" && Number.isFinite(value),
+              )
+            : undefined,
+          pollutedArtifactIds: Array.isArray(options.pollutedArtifactIds)
+            ? options.pollutedArtifactIds.filter(
+                (value: unknown): value is string => typeof value === "string",
+              )
+            : undefined,
+        });
         return Response.json({ success: true, result });
       }
 

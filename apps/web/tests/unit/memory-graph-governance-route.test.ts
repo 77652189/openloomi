@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { NextRequest } from "next/server";
 
 const {
   authMock,
@@ -39,11 +40,11 @@ import { POST } from "@/app/api/memory/raw-messages/route";
 
 function post(body: unknown) {
   return POST(
-    new Request("http://localhost/api/memory/raw-messages", {
+    new NextRequest("http://localhost/api/memory/raw-messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    }) as any,
+    }),
   );
 }
 

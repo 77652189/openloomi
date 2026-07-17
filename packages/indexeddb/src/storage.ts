@@ -30,7 +30,7 @@ export interface RawMessage {
   embeddingContentHash?: string;
   embeddingDimensions?: number;
   embeddingUpdatedAt?: number;
-  metadata?: Record<string, any>;
+  metadata?: Record<string, unknown>;
   createdAt: number;
   memoryStage?: MemoryStage;
   accessCount?: number;

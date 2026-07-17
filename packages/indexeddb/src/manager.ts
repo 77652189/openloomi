@@ -62,19 +62,21 @@ class IndexedDBManager implements RawMessageStorageManager {
   ): Promise<T> {
     try {
       return await operation();
-    } catch (error: any) {
+    } catch (error) {
+      const errorName = error instanceof Error ? error.name : undefined;
+      const errorMessage = error instanceof Error ? error.message : undefined;
       // Check if error is related to closed database connection
       if (
         maxRetries > 0 &&
-        (error.name === "InvalidStateError" ||
-          error.message?.includes("closing") ||
-          error.message?.includes("closed"))
+        (errorName === "InvalidStateError" ||
+          errorMessage?.includes("closing") ||
+          errorMessage?.includes("closed"))
       ) {
         // Close existing connection and reinitialize
         if (this.db) {
           try {
             this.db.close();
-          } catch (e) {
+          } catch {
             // Ignore close errors
           }
           this.db = null;
@@ -98,7 +100,7 @@ class IndexedDBManager implements RawMessageStorageManager {
         // Handle version mismatch (e.g., user has version 2 but code expects version 1)
         if (request.error?.name === "VersionError") {
           console.warn(
-            `[IndexedDB] Database version mismatch. Deleting and recreating database...`,
+            "[IndexedDB] Database version mismatch. Deleting and recreating database...",
           );
           const deleteRequest = indexedDB.deleteDatabase(DB_NAME);
           deleteRequest.onsuccess = () => {
@@ -147,7 +149,9 @@ class IndexedDBManager implements RawMessageStorageManager {
     db: IDBDatabase,
     transaction?: IDBTransaction | null,
   ): void {
-    const tx = transaction || (db as any).transaction;
+    const tx =
+      transaction ??
+      (db as IDBDatabase & { transaction?: IDBTransaction | null }).transaction;
     if (!tx) {
       console.error("[IndexedDB] No transaction available for upgrade");
       return;
@@ -162,13 +166,13 @@ class IndexedDBManager implements RawMessageStorageManager {
     ) => {
       try {
         if (!objectStore.indexNames.contains(name)) {
-          objectStore.createIndex(name, keyPath as any, {
+          objectStore.createIndex(name, keyPath, {
             unique,
             ...(options ?? {}),
           });
           console.log(`[IndexedDB] Created missing index: ${name}`);
         }
-      } catch (error: any) {
+      } catch (error) {
         console.warn(`[IndexedDB] Warning with index ${name}:`, error);
       }
     };
@@ -1098,19 +1102,21 @@ class IndexedDBManager implements RawMessageStorageManager {
         );
         if (dateOnly.getTime() === today.getTime()) {
           return "Today";
-        } else if (dateOnly.getTime() === yesterday.getTime()) {
-          return "Yesterday";
-        } else {
-          // Format: YYYY-MM-DD
-          return date.toISOString().split("T")[0];
         }
-      } else if (groupBy === "week") {
+        if (dateOnly.getTime() === yesterday.getTime()) {
+          return "Yesterday";
+        }
+        // Format: YYYY-MM-DD
+        return date.toISOString().split("T")[0];
+      }
+      if (groupBy === "week") {
         // Get the Monday of the week
         const dayOfWeek = date.getDay();
         const monday = new Date(date);
         monday.setDate(date.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
         return `Week of ${monday.toISOString().split("T")[0]}`;
-      } else if (groupBy === "month") {
+      }
+      if (groupBy === "month") {
         // Format: YYYY-MM (e.g., 2024-01)
         const year = date.getFullYear();
         const month = String(date.getMonth() + 1).padStart(2, "0");

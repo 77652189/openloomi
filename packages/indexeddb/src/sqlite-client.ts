@@ -16,6 +16,7 @@ import type {
   MemoryGraphEvolutionRunResult,
   RawMessageGraphEvolutionOptions,
 } from "./memory-graph-evolution";
+import type { RawMessageGraphLifecycleOptions } from "./memory-graph-lifecycle";
 
 export type SQLiteRawMessageQueryResultItem =
   | (RawMessage & { sourceType: "raw" })
@@ -47,6 +48,7 @@ export interface SQLiteRunMemoryForgettingCycleForUserOptions {
   dryRun?: boolean;
   hardDeleteArchivedOlderThan?: number;
   shadowDiagnostics?: RunMemoryForgettingCycleSerializableShadowDiagnosticsOptions;
+  graphLifecycle?: RawMessageGraphLifecycleOptions;
 }
 
 export interface SQLiteRunMemoryForgettingCycleForUserResult {
@@ -57,6 +59,7 @@ export interface SQLiteRunMemoryForgettingCycleForUserResult {
   archivedDetailRecords?: number;
   hardDeletedRecords?: number;
   shadowDiagnostics?: RunMemoryForgettingCycleResult["shadowDiagnostics"];
+  graphLifecycle?: RunMemoryForgettingCycleResult["graphLifecycle"];
   error?: string;
 }
 
@@ -261,7 +264,7 @@ export async function sqliteStoreRawMessagesFromInsight(
     embeddingContentHash?: string;
     embeddingDimensions?: number;
     embeddingUpdatedAt?: number;
-    metadata?: Record<string, any>;
+    metadata?: Record<string, unknown>;
   }>,
   graphEvolution?: RawMessageGraphEvolutionOptions,
 ): Promise<{
@@ -346,6 +349,7 @@ export async function sqliteRunMemoryForgettingCycleForUser(
       archivedDetailRecords: number;
       hardDeletedRecords: number;
       shadowDiagnostics?: RunMemoryForgettingCycleResult["shadowDiagnostics"];
+      graphLifecycle?: RunMemoryForgettingCycleResult["graphLifecycle"];
     };
   }>("forgettingCycle", { options });
   return {
@@ -356,6 +360,7 @@ export async function sqliteRunMemoryForgettingCycleForUser(
     archivedDetailRecords: response.result.archivedDetailRecords,
     hardDeletedRecords: response.result.hardDeletedRecords,
     shadowDiagnostics: response.result.shadowDiagnostics,
+    graphLifecycle: response.result.graphLifecycle,
   };
 }
 
@@ -493,8 +498,8 @@ export async function migrateIndexedDBRawMessagesToSQLite(options: {
 
   if (options.includeSummaries !== false) {
     offset = 0;
-    while (typeof (manager as any).querySummaries === "function") {
-      const summaries = await (manager as any).querySummaries({
+    while (true) {
+      const summaries = await manager.querySummaries({
         userId: options.userId,
         reverse: false,
         offset,

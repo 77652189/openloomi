@@ -9,6 +9,7 @@ import type {
 } from "./forgetting";
 import type {
   GroupByType,
+  IndexedDBManager,
   MemorySummaryRecord,
   RawMessage,
   RawMessageQuery,
@@ -18,6 +19,7 @@ import {
   type RawMessageGraphEvolutionOptions,
   storeRawMessagesWithGraphEvolution,
 } from "./memory-graph-evolution";
+import type { RawMessageGraphLifecycleOptions } from "./memory-graph-lifecycle";
 import {
   ensureRawMessagesSQLiteMigration,
   migrateIndexedDBRawMessagesToSQLite,
@@ -52,6 +54,7 @@ export interface RunMemoryForgettingCycleForUserOptions {
   dryRun?: boolean;
   hardDeleteArchivedOlderThan?: number;
   shadowDiagnostics?: RunMemoryForgettingCycleSerializableShadowDiagnosticsOptions;
+  graphLifecycle?: RawMessageGraphLifecycleOptions;
 }
 
 export interface RunMemoryForgettingCycleForUserResult {
@@ -62,10 +65,11 @@ export interface RunMemoryForgettingCycleForUserResult {
   archivedDetailRecords?: number;
   hardDeletedRecords?: number;
   shadowDiagnostics?: RunMemoryForgettingCycleResult["shadowDiagnostics"];
+  graphLifecycle?: RunMemoryForgettingCycleResult["graphLifecycle"];
   error?: string;
 }
 
-let managerInstance: any = null;
+let managerInstance: IndexedDBManager | null = null;
 
 /**
  * Initialize IndexedDB manager (client-side only)
@@ -137,7 +141,7 @@ export async function storeRawMessagesFromInsight(
     embeddingContentHash?: string;
     embeddingDimensions?: number;
     embeddingUpdatedAt?: number;
-    metadata?: Record<string, any>;
+    metadata?: Record<string, unknown>;
   }>,
   graphEvolution?: RawMessageGraphEvolutionOptions,
 ): Promise<{
@@ -331,7 +335,7 @@ export async function queryRawMessagesWithFallback(
         embeddingDimensions: item.record.embeddingDimensions,
         embeddingUpdatedAt: item.record.embeddingUpdatedAt,
         metadata:
-          (item.record.metadata as Record<string, any> | undefined) ??
+          (item.record.metadata as Record<string, unknown> | undefined) ??
           undefined,
         createdAt: item.record.timestamp,
         memoryStage: item.record.tier,
@@ -480,6 +484,7 @@ export async function runMemoryForgettingCycleForUser(
       archivedDetailRecords: result.archivedDetailRecords,
       hardDeletedRecords: result.hardDeletedRecords,
       shadowDiagnostics: result.shadowDiagnostics,
+      graphLifecycle: result.graphLifecycle,
     };
   } catch (error) {
     console.error(

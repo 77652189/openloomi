@@ -96,6 +96,18 @@ function isGraphRollbackCommand(value: unknown): boolean {
   return isGraphCommandBase(value) && typeof value.summaryId === "string";
 }
 
+function withoutClientOwnerScope(
+  command: Record<string, unknown>,
+): Record<string, unknown> {
+  const {
+    userId: _userId,
+    workspaceId: _workspaceId,
+    tenantId: _tenantId,
+    ...serverScopedCommand
+  } = command;
+  return serverScopedCommand;
+}
+
 function optionalFiniteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value)
     ? value
@@ -490,11 +502,13 @@ export async function POST(request: NextRequest) {
             "command object is required",
           ).toResponse();
         }
+        const command = withoutClientOwnerScope(
+          body.command as Record<string, unknown>,
+        );
         const result = await runMemoryGraphCorrection({
           storage: manager,
           userId,
-          command:
-            body.command as unknown as RawMessageMemoryGraphCorrectionCommand,
+          command: command as unknown as RawMessageMemoryGraphCorrectionCommand,
         });
         return Response.json({ success: true, result });
       }
@@ -506,11 +520,13 @@ export async function POST(request: NextRequest) {
             "command object is required",
           ).toResponse();
         }
+        const command = withoutClientOwnerScope(
+          body.command as Record<string, unknown>,
+        );
         const result = await runMemoryGraphRollback({
           storage: manager,
           userId,
-          command:
-            body.command as unknown as RawMessageMemoryGraphRollbackCommand,
+          command: command as unknown as RawMessageMemoryGraphRollbackCommand,
         });
         return Response.json({ success: true, result });
       }
@@ -524,12 +540,8 @@ export async function POST(request: NextRequest) {
             typeof options.scenarioId === "string"
               ? options.scenarioId
               : "memory-graph-runtime-rollout",
-          workspaceId:
-            typeof options.workspaceId === "string"
-              ? options.workspaceId
-              : undefined,
-          tenantId:
-            typeof options.tenantId === "string" ? options.tenantId : undefined,
+          workspaceId: undefined,
+          tenantId: undefined,
           queryEmbedding: Array.isArray(options.queryEmbedding)
             ? options.queryEmbedding.filter(
                 (value: unknown): value is number =>
